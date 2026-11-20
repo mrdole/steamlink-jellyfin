@@ -20,7 +20,7 @@ scripts/check.sh
 NOTES=$(python3 - "$V" <<'PY'
 import re, sys
 s = open("CHANGELOG.md").read()
-m = re.search(r"^## \[" + re.escape(sys.argv[1]) + r"\][^\n]*\n(.*?)(?=^## \[|\Z)", s, re.S | re.M)
+m = re.search(r"^## \[" + re.escape(sys.argv[1]) + r"\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]: |\Z)", s, re.S | re.M)
 body = (m.group(1).strip() if m else "")
 if not body:
     sys.exit("CHANGELOG section for this version is empty")
