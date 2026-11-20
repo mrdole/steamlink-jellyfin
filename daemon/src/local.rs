@@ -166,7 +166,18 @@ fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &st
                 "/Users/{uid}/Items?SearchTerm={term}&Recursive=true&IncludeItemTypes={types}&Limit={n}&{FIELDS}"
             ));
             let mut all = find("Series,Movie", 20).as_array().cloned().unwrap_or_default();
-            all.extend(find("Episode", 12).as_array().cloned().unwrap_or_default());
+            // an episode match shows as its series (OK opens seasons -> episodes), not as a loose episode
+            let mut more: Vec<String> = Vec::new();
+            for e in find("Episode", 30).as_array().cloned().unwrap_or_default() {
+                let sid = e["poster"].as_str().map(safe).unwrap_or_default();
+                if !sid.is_empty() && !more.contains(&sid) && !all.iter().any(|a| a["id"].as_str() == Some(sid.as_str())) {
+                    more.push(sid);
+                }
+            }
+            if !more.is_empty() {
+                all.extend(list(api, &format!("/Users/{uid}/Items?Ids={}&{FIELDS}", more.join(",")))
+                    .as_array().cloned().unwrap_or_default());
+            }
             ok(Value::Array(all))
         }
         "/image" => {

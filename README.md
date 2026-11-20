@@ -2,7 +2,7 @@
 
 > **⚠️ EARLY ALPHA.** This works on one Steam Link against one Jellyfin server, set up by hand. Expect rough edges,
 > breaking changes to config and layout, and steps that assume you are comfortable with ssh and cross-compiling.
-> There are no prebuilt binaries yet. Please open an issue with what you tried and what happened.
+> There are no prebuilt binaries yet. Current version: see [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md). Please open an issue with what you tried and what happened.
 
 A Jellyfin player for Valve's discontinued **Steam Link** box, using its own hardware video decoder. The box becomes
 a small Jellyfin client at the TV: a TV-style app on its home screen, plus a "Play on" target for the Jellyfin apps
@@ -54,6 +54,7 @@ scripts/deploy.sh                                        # copy to the Link and 
 
 Full steps: [docs/INSTALL.md](docs/INSTALL.md). Settings: [docs/CONFIG.md](docs/CONFIG.md).
 How it works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Hacking on it: [docs/DEVELOPING.md](docs/DEVELOPING.md).
+Versions and releases: [CHANGELOG.md](CHANGELOG.md), [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Known limits
 

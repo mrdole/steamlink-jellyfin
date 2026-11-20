@@ -14,6 +14,8 @@ Optional features (LAN API, ...) are extra keys in that config.json: docs/CONFIG
 """
 import argparse, getpass, json, os, subprocess, sys, urllib.error, urllib.request
 
+VERSION = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")).read().strip()
+
 REMOTE = "/mnt/scratch/sljf"
 HOST = os.environ.get("SLJF_HOST", "steamlink")
 DEVICE = "Steam Link"
@@ -32,11 +34,11 @@ def main():
     if not user:
         sys.exit("A Jellyfin user is required")
     pw = getpass.getpass("Password (not shown): ")
-    auth = f'MediaBrowser Client="Steam Link", Device="{DEVICE}", DeviceId="{a.device_id}", Version="0.2"'
+    auth = f'MediaBrowser Client="Steam Link", Device="{DEVICE}", DeviceId="{a.device_id}", Version="{VERSION}"'
     req = urllib.request.Request(server + "/Users/AuthenticateByName", method="POST",
                                  data=json.dumps({"Username": user, "Pw": pw}).encode(),
                                  headers={"Authorization": auth, "Content-Type": "application/json",
-                                          "User-Agent": "SteamLinkJellyfin/0.2"})
+                                          "User-Agent": f"SteamLinkJellyfin/{VERSION}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             res = json.load(r)

@@ -32,6 +32,9 @@
  * moves the audio to match the picture: silence is inserted when the sound is ahead, samples are dropped when it
  * is behind. Checked once a second, corrected when the average is off by more than SYNC_SLACK_MS.
  */
+#ifndef SLJF_VERSION
+#define SLJF_VERSION "dev"   /* scripts/build.sh passes the VERSION file */
+#endif
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
@@ -110,7 +113,8 @@ static int card(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds]\n"); return 2; }
+    if (argc >= 2 && !strcmp(argv[1], "--version")) { puts(SLJF_VERSION); return 0; }
+    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds] | --card | --version\n"); return 2; }
     if (!strcmp(argv[1], "--card")) {
         signal(SIGINT, on_signal); signal(SIGTERM, on_signal); setvbuf(stdout, NULL, _IOLBF, 0);
         return card();
@@ -124,7 +128,7 @@ int main(int argc, char **argv) {
     AVDictionary *opts = NULL;
     const char *h = getenv("SLJF_HEADERS"), *ua = getenv("SLJF_UA");
     if (h) av_dict_set(&opts, "headers", h, 0);
-    av_dict_set(&opts, "user_agent", ua ? ua : "SteamLinkJellyfin/0.1", 0);
+    av_dict_set(&opts, "user_agent", ua ? ua : "SteamLinkJellyfin/" SLJF_VERSION, 0);
     const char *ca = getenv("SLJF_CA");                /* current CA list shipped with the app */
     if (ca) { av_dict_set(&opts, "ca_file", ca, 0); av_dict_set(&opts, "tls_verify", "1", 0); }
     av_dict_set(&opts, "rw_timeout", "15000000", 0);  /* 15 s: give up instead of hanging */

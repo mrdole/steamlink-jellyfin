@@ -7,7 +7,7 @@
 | `player/` | `sljf-play.c` (playback), `sljf-subs.c` (subtitle + bar overlay) |
 | `daemon/` | `sljfd` (Rust): `src/main.rs` Jellyfin session + player control, `src/local.rs` local/LAN HTTP |
 | `app/` | On-TV app: `main.cpp` (Qt host, controller input), `main.qml` (UI), `run.sh`, `toc.txt` (tile) |
-| `scripts/` | `build.sh`, `build-app.sh`, `deploy.sh` |
+| `scripts/` | `build.sh`, `build-app.sh`, `deploy.sh`; `check.sh` (pre-merge checks, also CI), `bump-version`, `release.sh` (docs/RELEASING.md) |
 | `tools/` | Test and dev tools (below) |
 | `themes/` | App themes |
 | `out/` | Build output (gitignored) |
