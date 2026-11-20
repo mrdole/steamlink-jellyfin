@@ -19,7 +19,8 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
   queue with next-episode countdown and "still watching", sleep timer, audio/subtitle track choice, Live TV,
   automatic recovery after network drops and reboots; local API for the on-TV app.
 - On-TV app (`sljf-ui`, Qt Quick): Continue Watching, Next Up, Live TV, Libraries, Search (series from episode
-  matches), play dialog with audio/subtitle rows, back to where you were after playback; themes in `themes/`.
+  matches), play dialog with audio/subtitle rows, back to where you were after playback; themes in `themes/` or
+  any theme file (`THEME=/path.yaml`).
 - Optional LAN API (`lan_allow`, `lan_port`): `/text` opens Search with text, e.g. from Home Assistant.
 - Build, deploy and test scripts for Valve's steamlink-sdk; docs for install, config, architecture and integrations
   (Jellyfin apps, Home Assistant, LAN API, keyboard/controller).
