@@ -1,0 +1,34 @@
+#!/bin/sh
+# Steam Link Jellyfin player daemon (github.com/mrdole/steamlink-jellyfin). Installed by deploy.sh as
+# /etc/init.d/startup/S98sljfd (the /etc overlay on /mnt/config survives reboots); files live in /mnt/scratch/sljf.
+#   S98sljfd start|stop|restart|status
+D=/mnt/scratch/sljf
+RUN=/var/run/sljfd.run     # holds the id of the one supervisor loop that may keep running
+
+stop() {
+    rm -f $RUN
+    killall sljfd 2>/dev/null
+    killall sljf-play 2>/dev/null
+    rm -f /tmp/sljf.hold
+}
+
+start() {
+    [ -x $D/sljfd ] && [ -f $D/config.json ] || { echo "sljfd: not installed or not logged in (sljf-login)"; return 0; }
+    ID="$$-$(date +%s)"
+    echo "$ID" >$RUN
+    # setsid + closed stdio: detached from the ssh session or boot script that started it
+    setsid sh -c "
+        while [ \"\$(cat $RUN 2>/dev/null)\" = \"$ID\" ]; do
+            [ -f $D/sljfd.log ] && mv $D/sljfd.log $D/sljfd.log.1
+            $D/sljfd $D/config.json >$D/sljfd.log 2>&1
+            sleep 5
+        done" </dev/null >/dev/null 2>&1 &
+}
+
+case "${1:-start}" in
+    start) stop; start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    status) ps | grep "[s]ljfd " ; tail -5 $D/sljfd.log 2>/dev/null ;;
+esac
+exit 0

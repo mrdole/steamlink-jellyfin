@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Playback-core test: play one Jellyfin item on the Steam Link with sljf-play (docs/DEVELOPING.md).
+
+  sljf-test                      a random H.264 movie (8-bit, <=1080p): video copied as-is, audio -> stereo AAC
+  sljf-test "parks and rec"      first match for a search
+  sljf-test <item id>            that item
+  sljf-test path/to/file.ts      a local file (copied to the Link, no Jellyfin): e.g. the lip-sync test clip from
+                                 tools/make-sync-test.sh
+  options: --seconds N (default 60)  --start MIN (start offset)  --transcode (ask Jellyfin to re-encode the video
+           to H.264 too, for HEVC / 10-bit items)  --info (print the choice and URL, play nothing)
+           --av-offset MS (lip-sync fine-tune: positive plays the sound later; default: av_offset_ms from the Link's config)
+
+Server and token: the Link's own login (/mnt/scratch/sljf/config.json, written by tools/sljf-login), read over ssh
+for this run only. The token reaches the Link on ssh's stdin (never in a URL, argv or a file).
+Needs key login over ssh (host alias SLJF_HOST, default `steamlink`) and scripts/build.sh output in out/.
+"""
+import argparse, json, os, random, shlex, subprocess, sys, urllib.parse, urllib.request, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "..", "out")
+HOST = os.environ.get("SLJF_HOST", "steamlink")
+REMOTE = "/mnt/scratch/sljf"
+UA = "SteamLinkJellyfin/0.1"
+CLIENT = "Steam Link test"
+
+
+def link_login():
+    """The Link's own Jellyfin login (server, user_id, token, device_id, av_offset_ms), read over ssh for this run."""
+    p = subprocess.run(["ssh", "-o", "ConnectTimeout=8", HOST, f"cat {REMOTE}/config.json"],
+                       capture_output=True, text=True)
+    if p.returncode:
+        sys.exit(f"Could not read {HOST}:{REMOTE}/config.json (run tools/sljf-login first): " + p.stderr.strip())
+    return json.loads(p.stdout)
+
+
+def auth_header(c):
+    return (f'MediaBrowser Client="{CLIENT}", Device="Steam Link", DeviceId="{c["device_id"]}", '
+            f'Version="0.1", Token="{c["token"]}"')
+
+
+def api(c, path, method="GET"):
+    req = urllib.request.Request(c["server"] + path, method=method,
+                                 headers={"Authorization": auth_header(c), "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read()
+    return json.loads(body) if body else None
+
+
+def video_stream(item):
+    return next((s for s in item.get("MediaStreams") or [] if s["Type"] == "Video"), {})
+
+
+def playable(item):
+    v = video_stream(item)
+    return v.get("Codec") == "h264" and "10" not in (v.get("Profile") or "") and (v.get("Height") or 0) <= 1088
+
+
+def pick(c, what):
+    q = "Recursive=true&Fields=MediaStreams,MediaSources&IncludeItemTypes=Movie,Episode"
+    if what and len(what) == 32 and all(ch in "0123456789abcdef" for ch in what.lower()):
+        return api(c, f"/Users/{c['user_id']}/Items/{what}")
+    if what:
+        items = api(c, f"/Users/{c['user_id']}/Items?{q}&Limit=20&SearchTerm={urllib.parse.quote(what)}")["Items"]
+        if not items:
+            sys.exit(f"Nothing found for {what!r}")
+        return next((i for i in items if playable(i)), items[0])
+    items = api(c, f"/Users/{c['user_id']}/Items?{q.replace('Movie,Episode', 'Movie')}&SortBy=Random&Limit=50")["Items"]
+    return random.choice([i for i in items if playable(i)])
+
+
+# The Link's powermanager counts "no controller input" as idle and tries to sleep in the middle of playback (the
+# suspend fails with the decoder busy and the box reboots: seen 2026-11-19 after 16 min). Its D-Bus method
+# SetActivity takes 0 or 1 (2+ = "unknown activity"); 1 is sent every 20 s while the menu is parked. Whether that
+# restarts the idle countdown is NOT proven yet; the idle timeout is also 12 h now (suspend_timeout_idle.txt).
+KEEP_AWAKE = ("dbus-send --system --dest=system.powermanager /powermanager "
+              "system.powermanager.SetActivity uint32:1")
+
+
+def park_menu():
+    # Free the screen the way the Link's own app launcher does: shell.sh runs /tmp/launch_cmdline.txt when the menu
+    # (`shell`) exits, then restarts the menu. Park it on a wait loop that ends when /tmp/sljf.hold goes away
+    # (/tmp/sljf.hold is removed up to 20 s later; the loop also pings the powermanager, see KEEP_AWAKE).
+    subprocess.run(["ssh", HOST, 'touch /tmp/sljf.hold; '
+                    'echo "while [ -e /tmp/sljf.hold ]; do ' + KEEP_AWAKE + '; sleep 20; done" '
+                    '>/tmp/launch_cmdline.txt; '
+                    'killall shell; sleep 2'], stderr=subprocess.DEVNULL)
+
+
+def play_file(a):
+    name = os.path.basename(a.what)
+    subprocess.run(["ssh", HOST, f"mkdir -p {REMOTE}"], check=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["scp", "-q", "-O", os.path.join(OUT, "sljf-play"), a.what, f"{HOST}:{REMOTE}/"],
+                   check=True, stderr=subprocess.DEVNULL)
+    park_menu()
+    try:
+        subprocess.run(["ssh", HOST, f"SLJF_AV_OFFSET_MS={a.av_offset} {REMOTE}/sljf-play "
+                        f"{REMOTE}/{shlex.quote(name)} {a.seconds}"], stderr=subprocess.STDOUT)
+    finally:
+        subprocess.run(["ssh", HOST, "rm -f /tmp/sljf.hold"], stderr=subprocess.DEVNULL)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("what", nargs="?")
+    ap.add_argument("--seconds", type=int, default=60)
+    ap.add_argument("--start", type=float, default=0, help="start offset in minutes")
+    ap.add_argument("--transcode", action="store_true")
+    ap.add_argument("--info", action="store_true")
+    ap.add_argument("--subs", type=int, metavar="INDEX",
+                    help="draw this text subtitle stream (downloaded as SRT) on the overlay; prints each change")
+    ap.add_argument("--av-offset", type=int, default=None,
+                    help="lip-sync fine-tune in ms: positive = sound later (default: av_offset_ms in the Link's config)")
+    a = ap.parse_args()
+
+    if a.what and os.path.isfile(a.what):
+        if a.av_offset is None:
+            a.av_offset = 0
+        return play_file(a)
+    c = link_login()
+    if a.av_offset is None:
+        a.av_offset = int(c.get("av_offset_ms") or 0)
+    c["device_id"] = "steamlink-test"
+    item = pick(c, a.what)
+    v = video_stream(item)
+    aud = next((s for s in item.get("MediaStreams") or [] if s["Type"] == "Audio"), {})
+    name = item.get("Name") + (f" ({item['SeriesName']})" if item.get("SeriesName") else "")
+    print(f"{name}  [{item['Id']}]\n  video {v.get('Codec')} {v.get('Profile')} {v.get('Width')}x{v.get('Height')} "
+          f"{(v.get('BitRate') or 0) // 1000} kbps | audio {aud.get('Codec')} {aud.get('Channels')} ch")
+    copy = playable(item) and not a.transcode
+    if not copy and not a.transcode:
+        print("  not H.264 8-bit <=1080p: the Link cannot decode it as-is, so Jellyfin will re-encode the video")
+    session = uuid.uuid4().hex
+    params = {"MediaSourceId": item["Id"], "DeviceId": c["device_id"], "PlaySessionId": session,
+              "Container": "ts", "VideoCodec": "h264", "AudioCodec": "aac", "AudioChannels": "2",
+              "MaxAudioChannels": "2", "AudioSampleRate": "48000", "AudioBitrate": "192000",
+              "AllowVideoStreamCopy": "true" if copy else "false", "AllowAudioStreamCopy": "false",
+              "StartTimeTicks": str(int(a.start * 60 * 10_000_000))}
+    if not copy:
+        params.update({"MaxWidth": "1920", "MaxHeight": "1080", "VideoBitrate": "8000000", "Profile": "high",
+                       "Level": "41", "MaxFramerate": "30"})
+    url = f"{c['server']}/Videos/{item['Id']}/stream.ts?" + urllib.parse.urlencode(params)
+    print("  " + ("video copied, audio -> stereo AAC" if copy else "video re-encoded to H.264, audio -> stereo AAC"))
+    if a.info:
+        print("  " + url)
+        return
+
+    for f in ("sljf-play", "ca.pem"):
+        if not os.path.exists(os.path.join(OUT, f)):
+            sys.exit(f"{OUT}/{f} missing: run scripts/build.sh")
+    subprocess.run(["ssh", HOST, f"mkdir -p {REMOTE}"], check=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["scp", "-q", "-O", os.path.join(OUT, "sljf-play"), os.path.join(OUT, "ca.pem"),
+                    f"{HOST}:{REMOTE}/"], check=True, stderr=subprocess.DEVNULL)
+
+    subs = ""
+    if a.subs is not None:
+        req = urllib.request.Request(f"{c['server']}/Videos/{item['Id']}/{item['Id']}/Subtitles/{a.subs}/0/Stream.srt",
+                                     headers={"Authorization": auth_header(c), "User-Agent": UA})
+        srt = urllib.request.urlopen(req, timeout=120).read()
+        subprocess.run(["ssh", HOST, "cat >/tmp/sljf-sub.srt"], input=srt, check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["scp", "-q", "-O", os.path.join(OUT, "sub.ttf"), f"{HOST}:{REMOTE}/"], stderr=subprocess.DEVNULL)
+        subs = f"SLJF_SUBS=/tmp/sljf-sub.srt SLJF_START={a.start * 60} "
+        print(f"  subtitles #{a.subs}: {len(srt) // 1024} kB SRT")
+    park_menu()
+    remote = (f'read -r H; export SLJF_HEADERS="Authorization: $H"$(printf "\\r\\n"); '
+              f'export {subs}SLJF_CA={REMOTE}/ca.pem SLJF_UA={UA} SLJF_AV_OFFSET_MS={a.av_offset}; '
+              f'exec {REMOTE}/sljf-play "$1" {a.seconds}')
+    try:
+        subprocess.run(["ssh", HOST, "sh", "-c", f"'{remote}'", "sljf", f"'{url}'"],
+                       input=auth_header(c) + "\n", text=True, stderr=subprocess.STDOUT)
+    finally:
+        subprocess.run(["ssh", HOST, "rm -f /tmp/sljf.hold"], stderr=subprocess.DEVNULL)  # menu comes back
+        try:   # stop the server-side ffmpeg for this session right away
+            api(c, f"/Videos/ActiveEncodings?DeviceId={c['device_id']}&PlaySessionId={session}", "DELETE")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

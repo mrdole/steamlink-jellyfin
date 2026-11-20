@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Remote-control the Steam Link's Jellyfin player (sljfd) through the Jellyfin server, the way the Jellyfin apps and
+Home Assistant do. For testing; uses the Link's own Jellyfin login, like sljf-test.
+
+  sljf-remote status                    the Link's session: now playing, position, paused
+  sljf-remote play <item id> [--at MIN] play an item
+  sljf-remote pause | unpause | stop
+  sljf-remote seek MIN                  jump to that minute
+  sljf-remote key up|down|left|right|select|back|home     drive the on-TV app (home also opens it from the Link menu)
+"""
+import importlib.machinery, importlib.util, os, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_l = importlib.machinery.SourceFileLoader("sljf_test", os.path.join(HERE, "sljf-test"))
+T = importlib.util.module_from_spec(importlib.util.spec_from_loader("sljf_test", _l)); _l.exec_module(T)
+
+
+def session(c, device_id):
+    s = [x for x in T.api(c, "/Sessions") if x.get("DeviceId") == device_id]
+    if not s:
+        sys.exit("The Steam Link is not connected to Jellyfin (ssh <link> /etc/init.d/startup/S98sljfd status)")
+    return s[0]
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        sys.exit(__doc__)
+    c = T.link_login(); link_id = c["device_id"]; c["device_id"] = "steamlink-test"
+    s = session(c, link_id); sid = s["Id"]
+    if a[0] == "status":
+        ps, now = s.get("PlayState") or {}, s.get("NowPlayingItem") or {}
+        print(f"session {sid[:8]} remote-control={s.get('SupportsRemoteControl')} media-control={s.get('SupportsMediaControl')} "
+              f"commands={s.get('SupportedCommands')}")
+        print(f"now: {now.get('Name')} | pos {(ps.get('PositionTicks') or 0) / 6e8:.2f} min | paused {ps.get('IsPaused')} "
+              f"| method {ps.get('PlayMethod')}")
+    elif a[0] == "play":
+        at = float(a[a.index("--at") + 1]) if "--at" in a else 0
+        T.api(c, f"/Sessions/{sid}/Playing?playCommand=PlayNow&itemIds={a[1]}&startPositionTicks={int(at * 6e8)}", "POST")
+    elif a[0] in ("pause", "unpause", "stop"):
+        T.api(c, f"/Sessions/{sid}/Playing/{a[0].capitalize()}", "POST")
+    elif a[0] == "key":      # on-TV app navigation: up down left right select back home (home also opens the app)
+        name = {"up": "MoveUp", "down": "MoveDown", "left": "MoveLeft", "right": "MoveRight", "select": "Select",
+                "back": "Back", "home": "GoHome"}[a[1]]
+        T.api(c, f"/Sessions/{sid}/Command/{name}", "POST")
+    elif a[0] == "seek":
+        T.api(c, f"/Sessions/{sid}/Playing/Seek?seekPositionTicks={int(float(a[1]) * 6e8)}", "POST")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

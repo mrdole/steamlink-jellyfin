@@ -1,0 +1,37 @@
+# Home Assistant package: a text box whose text opens Search on the Steam Link's on-TV app.
+# Needs the LAN API on the Link (docs/integrations/lan-api.md) with Home Assistant's IP in `lan_allow`.
+# Install: put this file in <config>/packages/ (with `homeassistant: packages: !include_dir_named packages` in
+# configuration.yaml), set the Link's address below, then reload input_text, rest_command and automations.
+input_text:
+  steam_link_search:
+    name: Search on Steam Link
+    max: 60
+    icon: mdi:magnify
+
+rest_command:
+  steam_link_search:
+    url: "http://STEAM_LINK_IP:8098/text?q={{ text | urlencode }}"
+    method: GET
+    timeout: 5
+
+automation:
+  - id: steam_link_search_send
+    alias: Steam Link search
+    description: Text typed in "Search on Steam Link" opens Search on the TV; the box is emptied after.
+    mode: queued
+    trigger:
+      - platform: state
+        entity_id: input_text.steam_link_search
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state | trim | length > 0 }}"
+    action:
+      - action: rest_command.steam_link_search
+        continue_on_error: true
+        data:
+          text: "{{ trigger.to_state.state | trim }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.steam_link_search
+        data:
+          value: ""

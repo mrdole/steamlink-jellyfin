@@ -1,0 +1,20 @@
+#!/bin/sh
+# sljf-memwatch [MINUTES] [INTERVAL_S]: sample the Steam Link's memory and our processes during a soak test.
+# One CSV line per sample to stdout: time, MemFree, Cached, MemAvailable-ish (free+cached), RSS (kB) of sljfd,
+# sljf-play and sljf-ui, sljfd's thread count and open fds, and whether something is playing.
+# Example: tools/sljf-memwatch 240 60   (host alias SLJF_HOST, default steamlink) > out/mem-$(date +%F).csv
+MIN=${1:-60}; EVERY=${2:-60}
+echo "time,free_kb,cached_kb,avail_kb,sljfd_kb,play_kb,ui_kb,sljfd_threads,sljfd_fds,playing"
+end=$(( $(date +%s) + MIN * 60 ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    ssh -o ConnectTimeout=10 "${SLJF_HOST:-steamlink}" '
+        rss() { p=$(pidof $1 | cut -d" " -f1); [ -n "$p" ] && awk "/VmRSS/{print \$2}" /proc/$p/status || echo 0; }
+        f=$(awk "/MemFree/{print \$2}" /proc/meminfo); c=$(awk "/^Cached/{print \$2}" /proc/meminfo)
+        d=$(pidof sljfd | cut -d" " -f1)
+        th=$( [ -n "$d" ] && awk "/Threads/{print \$2}" /proc/$d/status || echo 0)
+        fd=$( [ -n "$d" ] && ls /proc/$d/fd | wc -l || echo 0)
+        pl=$(wget -q -O - "http://127.0.0.1:8097/events?since=0" 2>/dev/null | grep -o "\"playing\":[a-z]*" | cut -d: -f2)
+        echo "$(date +%T),$f,$c,$((f + c)),$(rss sljfd),$(rss sljf-play),$(rss sljf-ui),$th,$fd,${pl:-?}"' 2>/dev/null \
+        || echo "$(date +%T),unreachable"
+    sleep "$EVERY"
+done

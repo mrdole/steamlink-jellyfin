@@ -1,0 +1,4 @@
+#!/bin/sh
+# The SDK's ARM gcc needs its own libmpfr etc. and a C locale; cargo (ring's build script) calls this wrapper.
+SDK=${SDK:-$HOME/steamlink-sdk}
+LD_LIBRARY_PATH=$SDK/toolchain/lib LC_ALL=C exec "$SDK/toolchain/bin/armv7a-cros-linux-gnueabi-gcc" --sysroot="$SDK/rootfs" "$@"

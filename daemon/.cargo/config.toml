@@ -1,0 +1,11 @@
+# Cross build for the Steam Link (ARMv7 hard-float, static musl: nothing from the box's 2014 glibc is used).
+#   scripts/build.sh builds it; by hand: cargo build --release --target armv7-unknown-linux-musleabihf
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
+
+[env]
+# ring (TLS crypto) compiles a little C/asm: use the SDK's ARM gcc for that, through ./arm-cc
+CC_armv7_unknown_linux_musleabihf = { value = "arm-cc", relative = true }
+# AR_armv7_unknown_linux_musleabihf is set by scripts/build.sh from $SDK
+CFLAGS_armv7_unknown_linux_musleabihf = "-march=armv7-a -mfpu=neon -mfloat-abi=hard"

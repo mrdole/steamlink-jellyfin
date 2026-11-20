@@ -1,0 +1,13 @@
+{
+  "server": "https://jellyfin.example.com",
+  "user_id": "written-by-sljf-login",
+  "token": "written-by-sljf-login",
+  "device_id": "steamlink",
+  "device_name": "Steam Link",
+  "av_offset_ms": 0,
+  "audio_lang": "eng",
+  "player": "/mnt/scratch/sljf/sljf-play",
+  "ca": "/mnt/scratch/sljf/ca.pem",
+  "lan_allow": ["192.0.2.10"],
+  "lan_port": 8098
+}

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""One-time Jellyfin login for the Steam Link player daemon (sljfd). Run on your computer, in your own terminal.
+
+- Asks for the username and password (not echoed, never stored on this computer).
+- Exchanges them with the server for an access token (/Users/AuthenticateByName) as its own device "Steam Link".
+- Sends the config straight to the Link over ssh stdin: /mnt/scratch/sljf/config.json (mode 600). Nothing secret is
+  printed or written on this computer.
+
+Usage:  tools/sljf-login --server https://jellyfin.example.com [--user NAME] [--av-offset MS] [--device-id ID]
+        SLJF_HOST=<ssh host alias> (default: steamlink)
+Undo:   Jellyfin Dashboard -> Devices: remove "Steam Link" (revokes the token), and
+        ssh steamlink 'rm /mnt/scratch/sljf/config.json'
+Optional features (LAN API, ...) are extra keys in that config.json: docs/CONFIG.md.
+"""
+import argparse, getpass, json, os, subprocess, sys, urllib.error, urllib.request
+
+REMOTE = "/mnt/scratch/sljf"
+HOST = os.environ.get("SLJF_HOST", "steamlink")
+DEVICE = "Steam Link"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--server", required=True, help="Jellyfin server URL, e.g. https://jellyfin.example.com")
+    ap.add_argument("--user", default="")
+    ap.add_argument("--av-offset", type=int, default=0,
+                    help="lip-sync fine-tune in ms for this TV: positive plays the sound later (see docs/CONFIG.md)")
+    ap.add_argument("--device-id", default="steamlink", help="Jellyfin DeviceId, unique per Steam Link")
+    a = ap.parse_args()
+    server = a.server.rstrip("/")
+    user = input(f"Jellyfin user [{a.user}]: ").strip() or a.user
+    if not user:
+        sys.exit("A Jellyfin user is required")
+    pw = getpass.getpass("Password (not shown): ")
+    auth = f'MediaBrowser Client="Steam Link", Device="{DEVICE}", DeviceId="{a.device_id}", Version="0.2"'
+    req = urllib.request.Request(server + "/Users/AuthenticateByName", method="POST",
+                                 data=json.dumps({"Username": user, "Pw": pw}).encode(),
+                                 headers={"Authorization": auth, "Content-Type": "application/json",
+                                          "User-Agent": "SteamLinkJellyfin/0.2"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        hint = {401: " (wrong user or password)",
+                403: " (the account may only allow listed devices: Dashboard -> Users -> Access)"}.get(e.code, "")
+        sys.exit(f"Login failed: http {e.code}{hint}")
+    cfg = {"server": server, "user_id": res["User"]["Id"], "token": res["AccessToken"], "device_id": a.device_id,
+           "device_name": DEVICE, "av_offset_ms": a.av_offset, "player": f"{REMOTE}/sljf-play",
+           "ca": f"{REMOTE}/ca.pem"}
+    p = subprocess.run(["ssh", HOST, f"mkdir -p {REMOTE} && umask 077 && cat > {REMOTE}/config.json && "
+                        f"chmod 600 {REMOTE}/config.json"], input=json.dumps(cfg), text=True,
+                       stderr=subprocess.DEVNULL)
+    if p.returncode:
+        sys.exit(f"Logged in, but could not write the config on the Link (is `ssh {HOST}` working?)")
+    print(f"Logged in as {res['User']['Name']}; config written to {HOST}:{REMOTE}/config.json")
+    print("Start or restart the daemon:  scripts/deploy.sh")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+# Theme for the on-TV app. scripts/build-app.sh turns `palette` into theme.js and copies `font` (Regular + Bold,
+# found with fc-match on the build machine) next to the app. Copy this file to make another theme: THEME=<name>.
+# Every palette key below is used by app/main.qml, so a new theme must name all of them.
+name: Gruvbox
+font: Noto Sans
+palette:
+  bg: "#1d2021"         # page background
+  card: "#282828"       # cards
+  raised: "#3c3836"     # pressed / off / input fields
+  edge: "#504945"       # borders, dividers
+  edge_hi: "#665c54"    # stronger borders
+  fg: "#ebdbb2"         # body text
+  dim: "#a89984"        # secondary text
+  bright: "#fbf1c7"     # brightest text
+  on_accent: "#1d2021"  # text on accent/warn/good/bad backgrounds
+  accent: "#fabd2f"     # the main highlight (yellow)
+  warn: "#fe8019"       # second highlight / warning (orange)
+  good: "#b8bb26"       # ok (green)
+  info: "#83a598"       # info (blue)
+  cool: "#8ec07c"       # aqua
+  special: "#d3869b"    # purple
+  bad: "#fb4934"        # problem (red)
+  bad_deep: "#9d0006"   # alarm background
+  shadow: "#0d0e0e"     # hard offset shadows
+  bg_deep: "#141617"    # darker than bg
+  black: "#000000"      # true black (video letterbox)
