@@ -11,6 +11,8 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 SDK=${SDK:-$HOME/steamlink-sdk}
 [ -f "$SDK/setenv.sh" ] || { echo "Steam Link SDK not found at $SDK (set SDK=...; see docs/INSTALL.md)" >&2; exit 1; }
 W=$SDK/build-sljf; mkdir -p "$W" "$HERE/out"
+VERSION=$(cat "$HERE/VERSION")
+grep -q "^version = \"$VERSION\"" "$HERE/daemon/Cargo.toml" || { echo "VERSION ($VERSION) and daemon/Cargo.toml differ: run scripts/bump-version" >&2; exit 1; }
 MBEDTLS=3.6.7
 FFMPEG=7.1.4
 J=$(nproc)
@@ -70,7 +72,7 @@ fi
 
 # --- the player ---
 eval "set -- $CC"; GCC=$1   # cross gcc; we pass our own sysroot flags
-$GCC --sysroot="$MARVELL_ROOTFS" $MARVELL_RPATH_LINK_OPTIONS $CFLAGS_ARM -std=gnu99 -Wall \
+$GCC --sysroot="$MARVELL_ROOTFS" $MARVELL_RPATH_LINK_OPTIONS $CFLAGS_ARM -std=gnu99 -Wall -DSLJF_VERSION="\"$VERSION\"" \
   -I"$PREFIX/include" -I"$MARVELL_ROOTFS/usr/include" -I"$MARVELL_ROOTFS/usr/include/freetype2" \
   -o "$HERE/out/sljf-play" "$HERE/player/sljf-play.c" "$HERE/player/sljf-subs.c" \
   -L"$PREFIX/lib" -lavformat -lavcodec -lswresample -lavutil -lmbedtls -lmbedx509 -lmbedcrypto \
@@ -86,4 +88,6 @@ cp "$HERE/daemon/target/armv7-unknown-linux-musleabihf/release/sljfd" "$HERE/out
 "$STRIP" "$HERE/out/sljfd"
 install -m 644 /etc/ssl/certs/ca-certificates.crt "$HERE/out/ca.pem"   # current CA list for the Link (its own is from 2013)
 install -m 644 "$(fc-match -f '%{file}' 'Noto Sans:bold')" "$HERE/out/sub.ttf"   # subtitle font (Noto Sans Bold, OFL)
+cp "$HERE/VERSION" "$HERE/out/VERSION"
+echo "built $VERSION"
 ls -l "$HERE/out"

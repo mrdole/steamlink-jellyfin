@@ -20,7 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "out")
 HOST = os.environ.get("SLJF_HOST", "steamlink")
 REMOTE = "/mnt/scratch/sljf"
-UA = "SteamLinkJellyfin/0.1"
+VERSION = open(os.path.join(HERE, "..", "VERSION")).read().strip()
+UA = f"SteamLinkJellyfin/{VERSION}"
 CLIENT = "Steam Link test"
 
 
@@ -35,7 +36,7 @@ def link_login():
 
 def auth_header(c):
     return (f'MediaBrowser Client="{CLIENT}", Device="Steam Link", DeviceId="{c["device_id"]}", '
-            f'Version="0.1", Token="{c["token"]}"')
+            f'Version="{VERSION}", Token="{c["token"]}"')
 
 
 def api(c, path, method="GET"):

@@ -35,4 +35,4 @@ Integrations that need no config on the Link: the Jellyfin apps and [Home Assist
 
 ## App theme
 
-Build-time, not in config.json: `THEME=<name> scripts/build-app.sh` uses `themes/<name>.yaml` (default `gruvbox`).
+Build-time, not in config.json: `THEME=<name> scripts/build-app.sh` uses `themes/<name>.yaml` (default `gruvbox`); `THEME=/path/to/my-theme.yaml` uses a theme kept outside the repo.

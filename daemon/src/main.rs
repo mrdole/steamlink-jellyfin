@@ -27,7 +27,9 @@ use tungstenite::{Message, WebSocket};
 
 mod local;
 
-const VERSION: &str = "0.9";
+/// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const UA: &str = concat!("SteamLinkJellyfin/", env!("CARGO_PKG_VERSION"));
 /// Episodes played on by themselves, with no key pressed, before the next one waits for OK ("Still watching?").
 const STILL_WATCHING_EPS: u32 = 3;
 /// The "Next episode in N s" countdown starts this long before the end of an episode.
@@ -114,13 +116,13 @@ impl<'a> Api<'a> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(15)))
             .http_status_as_error(false)
-            .user_agent("SteamLinkJellyfin/0.2")
+            .user_agent(UA)
             .build()
             .into();
         let slow: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(90)))
             .http_status_as_error(false)
-            .user_agent("SteamLinkJellyfin/0.2")
+            .user_agent(UA)
             .build()
             .into();
         Api { cfg, agent, slow }
@@ -436,7 +438,7 @@ impl<'a> Player<'a> {
             .env("SLJF_SUBS", tr.sub_path.as_deref().unwrap_or(""))
             .env("SLJF_HEADERS", format!("Authorization: {}\r\n", self.cfg.auth()))
             .env("SLJF_CA", &self.cfg.ca)
-            .env("SLJF_UA", "SteamLinkJellyfin/0.2")
+            .env("SLJF_UA", UA)
             .env("SLJF_AV_OFFSET_MS", self.cfg.av_offset_ms.to_string())
             .stdin(Stdio::piped()) // "osd" lines: the on-screen bar
             .stdout(Stdio::piped())
@@ -647,7 +649,7 @@ impl<'a> Player<'a> {
         std::thread::spawn(move || {
             let t = Instant::now();
             let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(150)))
-                .http_status_as_error(false).user_agent("SteamLinkJellyfin/0.2").build().into();
+                .http_status_as_error(false).user_agent(UA).build().into();
             // Cloudflare in front of Jellyfin gives up after ~100 s (http 524) while the server is still extracting the
             // track from a big file; it carries on and caches it, so asking again soon gets it (seen: 125 s -> 524,
             // then 11 s). Try up to 6 times before falling back to burning in.
@@ -1240,7 +1242,7 @@ fn serve(p: &mut Player) -> Result<(), String> {
     let ws_url = format!("{}/socket?deviceId={}", cfg.server.replacen("http", "ws", 1), cfg.device_id);
     let mut req = ws_url.as_str().into_client_request().map_err(|e| e.to_string())?;
     req.headers_mut().insert("Authorization", cfg.auth().parse().map_err(|_| "bad auth header")?);
-    req.headers_mut().insert("User-Agent", "SteamLinkJellyfin/0.2".parse().unwrap());
+    req.headers_mut().insert("User-Agent", UA.parse().unwrap());
     // own TCP connection, so a dead network cannot hang the connect or the TLS handshake (tungstenite::connect has no timeout)
     let host = cfg.server.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").to_string();
     let addr = if host.contains(':') { host.clone() } else { format!("{host}:{}", if cfg.server.starts_with("https") { 443 } else { 80 }) };

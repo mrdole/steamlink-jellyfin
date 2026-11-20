@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Set the release version everywhere it lives: VERSION, daemon/Cargo.toml (+ Cargo.lock), and a new CHANGELOG
+# section made from [Unreleased].        scripts/bump-version 0.1.0-alpha.2
+# Versions are SemVer: 0.MINOR.PATCH while pre-1.0, with -alpha.N / -beta.N / -rc.N pre-release suffixes.
+# Commit the result on a branch and merge it like any change; then scripts/release.sh tags it.
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+NEW=${1:?usage: scripts/bump-version X.Y.Z[-alpha.N]}
+[[ $NEW =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]] || { echo "not a SemVer release: $NEW" >&2; exit 1; }
+OLD=$(cat "$HERE/VERSION")
+[ "$NEW" != "$OLD" ] || { echo "already $NEW" >&2; exit 1; }
+grep -q "^## \[$NEW\]" "$HERE/CHANGELOG.md" && { echo "CHANGELOG already has $NEW" >&2; exit 1; }
+
+echo "$NEW" > "$HERE/VERSION"
+sed -i "s/^version = \"$OLD\"/version = \"$NEW\"/" "$HERE/daemon/Cargo.toml"
+grep -q "^version = \"$NEW\"" "$HERE/daemon/Cargo.toml" || { echo "could not set daemon/Cargo.toml" >&2; exit 1; }
+( cd "$HERE/daemon" && PATH="$HOME/.cargo/bin:$PATH" cargo update --quiet --package sljfd --offline 2>/dev/null \
+    || PATH="$HOME/.cargo/bin:$PATH" cargo update --quiet --package sljfd )
+# CHANGELOG: "## [Unreleased]" stays on top (empty); its entries move under "## [NEW] - today"
+python3 - "$HERE/CHANGELOG.md" "$NEW" <<'PY'
+import datetime, re, sys
+p, new = sys.argv[1], sys.argv[2]
+s = open(p).read()
+head = "## [Unreleased]\n"
+if head not in s:
+    sys.exit("CHANGELOG.md has no '## [Unreleased]' section")
+s = s.replace(head, f"{head}\n## [{new}] - {datetime.date.today().isoformat()}\n", 1)
+repo = "https://github.com/mrdole/steamlink-jellyfin"
+lines = [l for l in s.splitlines() if not l.startswith("[Unreleased]: ")]
+links = [f"[Unreleased]: {repo}/compare/v{new}...HEAD", f"[{new}]: {repo}/releases/tag/v{new}"]
+first = next((i for i, l in enumerate(lines) if re.match(r"^\[[0-9]", l)), len(lines))
+s = "\n".join(lines[:first] + links + lines[first:]) + "\n"
+open(p, "w").write(s)
+PY
+echo "$OLD -> $NEW: VERSION, daemon/Cargo.toml, Cargo.lock, CHANGELOG.md. Check the changelog text, then commit."

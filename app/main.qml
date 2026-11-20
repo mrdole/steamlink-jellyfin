@@ -224,7 +224,7 @@ Rectangle {
     property bool goWanted: false
     // text from the LAN API (e.g. a Home Assistant text box) or a Jellyfin app: Search with it typed, focus on the results
     function typedElsewhere(t) {
-        detail = null; starting = false; searching = true
+        detail = null; starting = false; searching = true; depth = 0
         term = t.toUpperCase().replace(/[^A-Z0-9 ]/g, "")
         sKey = 39; sZone = 0; debounce.stop(); goWanted = true; search()
         console.log("search from outside: " + term)
@@ -254,7 +254,7 @@ Rectangle {
             else if (k === "select") play(detail.resume ? dBtn === 1 : false)
             return
         }
-        if (searching) {
+        if (searching && depth === 0) {               // a show opened from the results is a page over Search
             if (k === "back") { searching = false; return }
             if (sZone === 0) {
                 var cols = 13, total = 40
@@ -300,8 +300,8 @@ Rectangle {
         var m = {}
         m[Qt.Key_Up] = "up"; m[Qt.Key_Down] = "down"; m[Qt.Key_Left] = "left"; m[Qt.Key_Right] = "right"
         m[Qt.Key_Return] = "select"; m[Qt.Key_Enter] = "select"; m[Qt.Key_Escape] = "back"; m[Qt.Key_Home] = "home"
-        if (searching && !detail && event.key === Qt.Key_Backspace) { sType("DEL"); event.accepted = true; return }
-        if (searching && !detail && event.text.length === 1 && /[a-zA-Z0-9 ]/.test(event.text)) {
+        if (searching && depth === 0 && !detail && event.key === Qt.Key_Backspace) { sType("DEL"); event.accepted = true; return }
+        if (searching && depth === 0 && !detail && event.text.length === 1 && /[a-zA-Z0-9 ]/.test(event.text)) {
             sType(event.text === " " ? "SPACE" : event.text.toUpperCase()); event.accepted = true; return
         }
         if (m[event.key]) { key(m[event.key]); event.accepted = true }
@@ -408,7 +408,7 @@ Rectangle {
         x: 40 * u; y: 26 * u; height: 40 * u; width: title.width + 28 * u; color: T.C.accent
         Text {
             id: title; anchors.centerIn: parent; color: T.C.on_accent
-            text: searching ? "SEARCH" : depth > 0 ? page.title.toUpperCase() : "JELLYFIN"
+            text: depth > 0 ? page.title.toUpperCase() : searching ? "SEARCH" : "JELLYFIN"
             font.family: T.FONT; font.pixelSize: 22 * u; font.bold: true
         }
     }
@@ -457,7 +457,7 @@ Rectangle {
     // ---- browse ----
     GridView {
         id: grid
-        visible: depth > 0 && !searching
+        visible: depth > 0
         property bool wide: root.page ? root.page.wide : false
         property real pw: (wide ? 270 : 150) * u
         property int perRow: Math.max(1, Math.floor(width / cellWidth))
@@ -474,14 +474,14 @@ Rectangle {
         }
     }
     Text {
-        visible: depth > 0 && !searching && root.page && root.page.items.length === 0
+        visible: depth > 0 && root.page && root.page.items.length === 0
         anchors.centerIn: parent; text: root.page && root.page.empty ? "NOTHING HERE" : "LOADING"
         color: T.C.dim; font.family: T.FONT; font.pixelSize: 22 * u
     }
 
     // ---- search ----
     Item {
-        visible: searching
+        visible: searching && depth === 0
         x: 40 * u; y: 86 * u; width: parent.width - 80 * u; height: parent.height - 126 * u
         Rectangle {
             width: parent.width; height: 46 * u; color: T.C.raised; border.width: 2 * u; border.color: T.C.edge_hi

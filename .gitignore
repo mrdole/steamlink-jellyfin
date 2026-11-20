@@ -3,3 +3,4 @@ daemon/target/
 __pycache__/
 *.pyc
 config.json
+*.orig
