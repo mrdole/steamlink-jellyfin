@@ -7,6 +7,8 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-11-20
+
 ### Added
 - `open_app_at_boot` (config, off by default): the on-TV app opens by itself after the Link starts, in place of the
   Link's "connect a controller" menu, so a Link without a controller can be used from the Jellyfin or Home Assistant
@@ -39,6 +41,7 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
 - One release version (`VERSION`) used by the daemon, player, tools and Jellyfin device info; `scripts/check.sh`,
   `scripts/bump-version`, `scripts/release.sh`, CI.
 
-[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.2...HEAD
+[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.3...HEAD
+[0.1.0-alpha.3]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.1
