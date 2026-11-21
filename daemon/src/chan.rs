@@ -84,6 +84,13 @@ fn secs_of(item: &Value) -> Option<u32> {
     if s > 0 { u32::try_from(s).ok() } else { None }
 }
 
+/// Episode overviews are kept to this many characters (the bar and the guide show a few lines; the snapshot stays small).
+const OVERVIEW_MAX: usize = 400;
+
+fn clip_overview(s: &str) -> String {
+    s.chars().take(OVERVIEW_MAX).collect()
+}
+
 fn ep_from(item: &Value) -> Option<Ep> {
     let id = item["Id"].as_str()?.to_string();
     let secs = secs_of(item)?;
@@ -96,7 +103,7 @@ fn ep_from(item: &Value) -> Option<Ep> {
         secs,
         title: item["Name"].as_str().unwrap_or("").to_string(),
         episode,
-        overview: item["Overview"].as_str().unwrap_or("").to_string(),
+        overview: clip_overview(item["Overview"].as_str().unwrap_or("")),
         series: item["SeriesName"].as_str().unwrap_or("").to_string(),
     })
 }
@@ -332,7 +339,7 @@ pub fn snapshot_from_saved(v: &Value) -> Option<Snapshot> {
                     secs: u32::try_from(e["secs"].as_u64()?).ok()?,
                     title: e["title"].as_str()?.to_string(),
                     episode: e["episode"].as_str()?.to_string(),
-                    overview: e["overview"].as_str()?.to_string(),
+                    overview: clip_overview(e["overview"].as_str()?),
                     // (absent in a file saved before it was added)
                     series: e["series"].as_str().unwrap_or("").to_string(),
                 });
@@ -370,6 +377,13 @@ pub fn snapshot_from_saved(v: &Value) -> Option<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overviews_are_cut_to_400_chars() {
+        assert_eq!(clip_overview("short"), "short");
+        let long = "é".repeat(500);
+        assert_eq!(clip_overview(&long).chars().count(), 400);
+    }
 
     fn j(s: &str) -> Value {
         serde_json::from_str(s).unwrap()

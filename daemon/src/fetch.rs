@@ -334,7 +334,11 @@ fn dir_ready(dir: &Path) -> bool {
     if dev(parent) != Some(md) || !parent.is_dir() {
         return false;
     }
-    dir.is_dir() || std::fs::create_dir(dir).is_ok()
+    if std::fs::symlink_metadata(dir).is_err() && std::fs::create_dir(dir).is_err() {
+        return false;
+    }
+    // the cache dir itself: a real directory on the stick (not a symlink out of it)
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir() && m.dev() == md)
 }
 
 /// A stick was mounted: forget failed jobs (retry them) and delete orphaned .part files from an interrupted run.

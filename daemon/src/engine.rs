@@ -388,15 +388,19 @@ impl Feed {
         }
         let mut next = p.next.clone();
         let delay = now - p.start_at;
+        let mut late = 0.0;
         if let Next::Video { start_secs, .. } = &mut next {
             if delay > DRIFT {
                 *start_secs += delay;
+                late = delay;
             }
         }
         let r = resolve(&next)?;
         let line = url_line(&r.url)?;
         self.first = None;
         if let Some(s) = self.sent.iter_mut().find(|s| s.seq == 1) {
+            // joined `late` s further in: it plays that much less (pred_end and the first filler follow)
+            s.len = (s.len - late).max(0.0);
             s.cache = r.cache.clone();
             s.session = r.session.clone();
             s.file = r.session.is_none();
@@ -860,8 +864,10 @@ mod tests {
             }
             res(n)
         };
+        let len0 = h.sent[0].len;
         h.first_line(EPOCH as f64 + 130.0, &mut rec).unwrap().unwrap();
         assert_eq!(seen, 130.0);
+        assert!((h.sent[0].len - (len0 - 30.0)).abs() < 1e-6, "joined 30 s in plays 30 s less: {}", h.sent[0].len);
         // a cached copy from the start beats a seek of up to DRIFT s
         let mut c = Feed::new(1);
         let mut cached = |n: &Next| match n {

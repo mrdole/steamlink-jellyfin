@@ -70,7 +70,7 @@ fn try_mount() -> Option<String> {
     let _ = std::fs::create_dir_all(MOUNT);
     for ty in ["vfat", "ext4", "ext3", "ext2"] {
         let ok = Command::new("mount")
-            .args(["-t", ty, "-o", "noatime", DEV, MOUNT])
+            .args(["-t", ty, "-o", "noatime,nosuid,nodev,noexec", DEV, MOUNT])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
