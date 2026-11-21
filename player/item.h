@@ -29,6 +29,8 @@ struct item {
     double limit_s;              /* play at most this long (0 = to the end) */
     double first_ts;             /* stream time of the first packet read */
     long pushed;                 /* packets read into the FIFO so far */
+    long bytes;                  /* packet bytes in the FIFO now */
+    double ahead;                /* its reader stops while this much is read ahead (channel: small while it waits) */
     int over;                    /* limit_s reached: nothing more of it is fed */
     int seq;                     /* position in the queue */
     int kind;                    /* 0 video, 1 card */
