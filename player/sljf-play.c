@@ -394,13 +394,16 @@ static void *opener(void *o) {
 }
 
 /* seconds until the item's cut: its limit (or length) less what has been fed of it (the FIFO head's stream time;
-   the limit is checked there too); 1e9 unknown (q_mu held) */
+   the limit is checked there too), and no more than what its FIFO holds once the reader is at the end (an item
+   shorter than it said); 1e9 unknown (q_mu held) */
 static double item_left(struct item *it) {
     double fed = !it->pushed ? 0 : (it->fifo_n ? it->fifo_ts[it->fifo_head] : it->last_ts) - it->first_ts;
-    if (it->limit_s > 0) return it->limit_s - fed;
-    if (it->fmt && it->fmt->duration != AV_NOPTS_VALUE && it->fmt->duration > 0)
-        return it->fmt->duration / (double)AV_TIME_BASE - fed;
-    return 1e9;
+    double left = 1e9;
+    if (it->limit_s > 0) left = it->limit_s - fed;
+    else if (it->fmt && it->fmt->duration != AV_NOPTS_VALUE && it->fmt->duration > 0)
+        left = it->fmt->duration / (double)AV_TIME_BASE - fed;
+    if (it->rd_eof && fifo_span(it) < left) left = fifo_span(it);
+    return left;
 }
 
 /* an item that will not play: reported now (sljfd moves on), dropped from the queue when its turn comes */
@@ -443,7 +446,9 @@ static void chan_open(struct item *cur, struct item *nxt, double card_left) {
     double left = card_left; int end = 1;
     if (card_left < 0) {
         pthread_mutex_lock(&q_mu);
-        left = item_left(cur); end = cur->rd_eof || cur->rd_err || cur->over;
+        /* (the reader at the end of a stream with a big read-ahead still has up to a minute to play: item_left
+           counts that, so the next item's connection is not opened early and left idle) */
+        left = item_left(cur); end = cur->rd_err || cur->over;
         pthread_mutex_unlock(&q_mu);
     }
     if (!item_should_open_next(left, end, 1, 0)) return;

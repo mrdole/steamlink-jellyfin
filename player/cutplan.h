@@ -17,7 +17,8 @@ enum cut cut_kind(int cur_w, int cur_h, int nxt_w, int nxt_h, int nxt_is_card);
 
 /* open the next item now? cur_play_left_s = seconds until the current item's cut (its limit or length minus what has
    been fed of it; very large when unknown): by time to the cut, not by what is left to read, so a big read-ahead
-   does not open the next item early and leave its server connection idle; cur_rd_eof = its reader hit the end
-   (shorter than it said); the next must be queued and not opened yet */
+   does not open the next item early and leave its server connection idle; cur_rd_eof = nothing more of it can be
+   fed: its reader failed or its limit is reached (sljf-play counts a reader at the end of a stream, which may be
+   shorter than it said, through cur_play_left_s); the next must be queued and not opened yet */
 int item_should_open_next(double cur_play_left_s, int cur_rd_eof, int nxt_queued, int nxt_opened);
 #endif
