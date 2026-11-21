@@ -63,7 +63,7 @@ sljfd builds channels itself; the server only holds the media. All of it is in `
 | Module | Role |
 |---|---|
 | `chan.rs` | Reads Jellyfin collections and the user's playlists named `Channel <N> <name>` (and `Bumpers` / `Commercials`, with an optional number) into a snapshot, once per schedule day. A failed load keeps the old one and retries in 10 min. |
-| `sched.rs` | Pure scheduler: what is on channel N at epoch second t. Each round puts every show on once in an order shuffled from a seed (channel number + round); each show hands out episodes in order and wraps. No talk between boxes: the same input gives the same answer. A cursor per channel avoids replaying from the epoch. |
+| `sched.rs` | Pure scheduler: what is on channel N at epoch second t. Each round puts every show on once in an order shuffled from a seed (channel number + round); each show hands out episodes in order and wraps. No talk between boxes: the same input gives the same answer. The daemon's calls (`slots`, `now`) replay each channel from the epoch (2026-01-01 at the day start) every time: a few thousand slots a year, cheap next to the network. (`Scheduler`, a per-channel cursor cache, is there for a later stage and is only used in tests.) |
 | `filler.rs` | Pure: picks bumpers and commercials for the gap between an item's end and the next half hour. Deterministic for a seed, so slot lengths agree across boxes. |
 | `engine.rs` | Pure, no clock: lays a channel out as entries (episode, its filler, next episode, ...), builds the guide and home JSON, and `Feed` turns entries into the stdin lines for one player run. |
 | `chanplay.rs` | The glue: tuning, lookups, restarts, the lineup, stick and fetcher. Talks to the player; `local.rs` serves `/home`, `/guide`, `/image?id=ch:N`, `/play?id=ch:N` from the lineup. |
@@ -82,7 +82,7 @@ reads stdin lines from sljfd:
   screen, so it can run while a player owns it.
 
 **How a cut works.** The first queued video is opened beside the one playing (own demuxer, reader and FIFO) when the
-current one has under 20 s left to read (`cutplan.h`), so its first packets are waiting. At the cut: the same
+current one has under 25 s left to play, counted from its limit or end, not from what is read ahead (`cutplan.h`), so its first packets are waiting. At the cut: the same
 picture size goes on in the same SLVideo stream with no gap (every item starts at SPS/PPS + IDR); a different size
 frees and remakes the stream; a card feeds no video. The new item's sound is held until it can start in step with its
 picture. While waiting, an item's reader keeps only a few seconds read ahead (two full FIFOs are too much for ~100 MB

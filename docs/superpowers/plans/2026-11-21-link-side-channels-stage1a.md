@@ -176,9 +176,10 @@ Refactor `player/sljf-play.c` so one playable item's state lives in a struct, as
   - stdout `item <seq> start` (first frame of the item shown, or card begun), `item <seq> end` (handed over or done),
     `queue empty` (current item fully read and nothing queued; sljfd is late)
   - `cutplan.h`: `enum cut { CUT_SAME, CUT_RESET, CUT_CARD }; enum cut cut_kind(int cur_w, int cur_h, int nxt_w,
-    int nxt_h, int nxt_is_card);` and `int item_should_open_next(double cur_read_ahead_s, int cur_rd_eof,
-    int nxt_queued, int nxt_opened);` (open the next when the current reader hit its end or has < 20 s left to read,
-    and it is queued and not yet opened)
+    int nxt_h, int nxt_is_card);` and `int item_should_open_next(double cur_play_left_s, int cur_rd_eof,
+    int nxt_queued, int nxt_opened);` (open the next when the current reader hit its end or the current item has
+    < 25 s left to play, i.e. its limit or end minus what has been fed, and it is queued and not yet opened;
+    by time to the cut, not by unread seconds: final review R13)
 - Cut rules: the next item is opened (its own reader thread, its own FIFO) as soon as `item_should_open_next` says
   so; when the current item's FIFO is empty after its reader's end (or its `limit_s` is reached: stop feeding it),
   - `CUT_SAME` (same width/height): keep feeding the same SLVideo stream with the next item's packets; reset
@@ -192,7 +193,7 @@ Refactor `player/sljf-play.c` so one playable item's state lives in a struct, as
 
 - [ ] **Step 1: Write failing host test** `player/test/cutplan-test.c`: `cut_kind(1920,1080,1920,1080,0)==CUT_SAME`,
   `cut_kind(1920,1080,1280,720,0)==CUT_RESET`, `cut_kind(1920,1080,0,0,1)==CUT_CARD`,
-  `item_should_open_next(30,0,1,0)==0`, `(19,0,1,0)==1`, `(50,1,1,0)==1`, `(5,0,0,0)==0`, `(5,0,1,1)==0`.
+  `item_should_open_next(30,0,1,0)==0`, `(26,0,1,0)==0`, `(24,0,1,0)==1`, `(50,1,1,0)==1`, `(5,0,0,0)==0`, `(5,0,1,1)==0`.
 - [ ] **Step 2:** Wire it into `scripts/check.sh` (same pattern as `live-buf-test`); `scripts/check.sh` → FAIL on it.
 - [ ] **Step 3:** Implement `cutplan.c`, then the queue and cuts in `sljf-play.c` as above.
 - [ ] **Step 4:** `scripts/check.sh` → ok; `SDK=/mnt/fast/steamlink-sdk scripts/build.sh` → builds, no warnings.

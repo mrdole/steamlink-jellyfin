@@ -393,12 +393,13 @@ static void *opener(void *o) {
     return NULL;
 }
 
-/* seconds of the item still to be read: its limit (or length) less what the reader has read; 1e9 unknown (q_mu held) */
+/* seconds until the item's cut: its limit (or length) less what has been fed of it (the FIFO head's stream time;
+   the limit is checked there too); 1e9 unknown (q_mu held) */
 static double item_left(struct item *it) {
-    double read = it->pushed ? it->last_ts - it->first_ts : 0;
-    if (it->limit_s > 0) return it->limit_s - read;
+    double fed = !it->pushed ? 0 : (it->fifo_n ? it->fifo_ts[it->fifo_head] : it->last_ts) - it->first_ts;
+    if (it->limit_s > 0) return it->limit_s - fed;
     if (it->fmt && it->fmt->duration != AV_NOPTS_VALUE && it->fmt->duration > 0)
-        return it->fmt->duration / (double)AV_TIME_BASE - read;
+        return it->fmt->duration / (double)AV_TIME_BASE - fed;
     return 1e9;
 }
 

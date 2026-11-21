@@ -8,15 +8,16 @@
 #ifndef SLJF_CUTPLAN_H
 #define SLJF_CUTPLAN_H
 
-#define CUT_OPEN_AHEAD_S 20.0   /* open the next item when the current one has less than this left to read */
+#define CUT_OPEN_AHEAD_S 25.0   /* open the next item when the current one has less than this left to play */
 
 enum cut { CUT_SAME, CUT_RESET, CUT_CARD };
 
 /* the cut from an item of cur_w x cur_h to the next (nxt_w x nxt_h, or a card) */
 enum cut cut_kind(int cur_w, int cur_h, int nxt_w, int nxt_h, int nxt_is_card);
 
-/* open the next item now? cur_read_ahead_s = seconds of the current item still to be read (its limit or length minus
-   what its reader has read; very large when unknown), cur_rd_eof = its reader hit the end; the next must be queued
-   and not opened yet */
-int item_should_open_next(double cur_read_ahead_s, int cur_rd_eof, int nxt_queued, int nxt_opened);
+/* open the next item now? cur_play_left_s = seconds until the current item's cut (its limit or length minus what has
+   been fed of it; very large when unknown): by time to the cut, not by what is left to read, so a big read-ahead
+   does not open the next item early and leave its server connection idle; cur_rd_eof = its reader hit the end
+   (shorter than it said); the next must be queued and not opened yet */
+int item_should_open_next(double cur_play_left_s, int cur_rd_eof, int nxt_queued, int nxt_opened);
 #endif
