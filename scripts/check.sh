@@ -41,7 +41,7 @@ if command -v cc >/dev/null; then
 else
     echo "skip player static generators + live-buf (cc not found)"
 fi
-for f in tools/sljf-login tools/sljf-test tools/sljf-remote app/shot.py; do
+for f in tools/sljf-login tools/sljf-test tools/sljf-chantest tools/sljf-remote app/shot.py; do
     python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" || bad "python parse $f"
 done
 ok "python scripts parse"

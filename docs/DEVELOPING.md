@@ -19,6 +19,7 @@ Every script takes `SLJF_HOST` (ssh alias of the Link, default `steamlink`) and 
 | Tool | Does |
 |---|---|
 | `tools/sljf-test [query or item id or file] --seconds N --start MIN [--transcode] [--subs N] [--info]` | Plays one item on the Link with the player directly (no daemon), prints the status lines. `--info` only shows the choice and URL |
+| `tools/sljf-chantest ID[:SECONDS[:START_MIN]] ... [--card N]` | Plays several items through one `sljf-play --channel` run (as sljfd feeds a channel) to check the cuts; the test build goes to `/tmp` on the Link |
 | `tools/sljf-remote status | play <id> [--at MIN] | pause | unpause | seek MIN | stop | key up|down|...` | Drives the daemon through the Jellyfin server, like a Jellyfin app does |
 | `tools/sljf-memwatch [MINUTES] [INTERVAL_S]` | CSV of the Link's memory and our processes, for soak tests |
 | `tools/make-sync-test.sh` | Generates `out/sync-test.ts`: a bar crosses a line with a flash + beep every 2 s. Play it with `tools/sljf-test out/sync-test.ts --seconds 120 --av-offset MS` to find `av_offset_ms` |

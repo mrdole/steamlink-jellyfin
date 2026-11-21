@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Channel-mode test: play a queue of Jellyfin items through one `sljf-play --channel` run on the Steam Link,
+the way sljfd feeds a channel (first item as "url", the rest as "next" lines), to check the cuts between them.
+
+  sljf-chantest ID[:SECONDS[:START_MIN]] ... [--card N]
+      each ID is a library item (episode, film or clip); SECONDS = how long to play it (0 = to its end), START_MIN =
+      where to start in it. --card N puts an N-second "Up next" card (silent static + bar) after every item.
+  example: sljf-chantest 1a2b..:40 3c4d..:40:5 --card 3
+
+Server and token: the Link's own login, read over ssh for this run only; the token reaches the Link on ssh's stdin.
+Needs scripts/build.sh output in out/. Prints the player's lines (look for "item N start" and "static on").
+"""
+import argparse, json, os, subprocess, sys, urllib.parse, urllib.request, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+OUT = os.path.join(HERE, "..", "out")
+HOST = os.environ.get("SLJF_HOST", "steamlink")
+REMOTE = "/mnt/scratch/sljf"
+VERSION = open(os.path.join(HERE, "..", "VERSION")).read().strip()
+UA = f"SteamLinkJellyfin/{VERSION}"
+
+
+def load_sljf_test():
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader("sljf_test", os.path.join(HERE, "sljf-test"))
+    spec = importlib.util.spec_from_loader("sljf_test", loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    return m
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("items", nargs="+")
+    ap.add_argument("--card", type=float, default=0)
+    a = ap.parse_args()
+    t = load_sljf_test()
+    c = t.link_login()
+    c["device_id"] = "steamlink-test"
+    lines, sessions = [], []
+    for k, spec in enumerate(a.items):
+        parts = spec.split(":")
+        iid, secs = parts[0], float(parts[1]) if len(parts) > 1 else 0
+        start = float(parts[2]) if len(parts) > 2 else 0
+        item = t.api(c, f"/Users/{c['user_id']}/Items/{iid}")
+        v = t.video_stream(item)
+        copy = t.playable(item)
+        session = uuid.uuid4().hex
+        sessions.append(session)
+        p = {"MediaSourceId": iid, "DeviceId": c["device_id"], "PlaySessionId": session, "Container": "ts",
+             "VideoCodec": "h264", "AudioCodec": "aac", "AudioChannels": "2", "MaxAudioChannels": "2",
+             "AudioSampleRate": "48000", "AudioBitrate": "192000", "AllowVideoStreamCopy": "true" if copy else "false",
+             "AllowAudioStreamCopy": "false", "StartTimeTicks": str(int(start * 60 * 10_000_000))}
+        if not copy:
+            p.update({"MaxWidth": "1920", "MaxHeight": "1080", "VideoBitrate": "8000000", "Profile": "high",
+                      "Level": "41", "MaxFramerate": "30"})
+        url = f"{c['server']}/Videos/{iid}/stream.ts?" + urllib.parse.urlencode(p)
+        print(f"item {len(lines) + 1}: {item.get('Name')} {v.get('Width')}x{v.get('Height')} "
+              f"{'copied' if copy else 're-encoded'}, {secs or 'all'} s from {start} min")
+        lines.append(f"url {url}" if not lines else f"next v {secs:g} {start * 60:g} {url}")
+        if a.card and k < len(a.items) - 1:
+            lines.append(f"next card {a.card:g} Up next")
+            print(f"item {len(lines)}: card {a.card:g} s")
+    # the first item's limit goes on the command line (as sljfd does for the item on air)
+    first_secs = float(a.items[0].split(":")[1]) if ":" in a.items[0] else 0
+    # the test build goes to /tmp: the installed player in REMOTE stays as it is
+    subprocess.run(["scp", "-q", "-O", os.path.join(OUT, "sljf-play"), f"{HOST}:/tmp/sljf-play-test"],
+                   check=True, stderr=subprocess.DEVNULL)
+    t.park_menu()
+    remote = (f'read -r H; export SLJF_HEADERS="Authorization: $H"$(printf "\\r\\n"); '
+              f'export SLJF_CA={REMOTE}/ca.pem SLJF_UA={UA} SLJF_STATIC=0 SLJF_PREBUFFER_MS=3000; '
+              f'exec /tmp/sljf-play-test --channel {first_secs:g}')
+    try:
+        subprocess.run(["ssh", HOST, "sh", "-c", f"'{remote}'"],
+                       input=t.auth_header(c) + "\n" + "\n".join(lines) + "\n", text=True, stderr=subprocess.STDOUT)
+    finally:
+        subprocess.run(["ssh", HOST, "rm -f /tmp/sljf.hold"], stderr=subprocess.DEVNULL)
+        for s in sessions:
+            try:
+                t.api(c, f"/Videos/ActiveEncodings?DeviceId={c['device_id']}&PlaySessionId={s}", "DELETE")
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()
