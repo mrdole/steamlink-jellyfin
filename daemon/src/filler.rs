@@ -25,6 +25,12 @@ pub enum Fill {
 
 /// Below this many seconds left, nothing is played.
 const MIN_CUT: f64 = 2.0;
+/// Clips shorter than this (or with a non-finite length) are ignored.
+const MIN_CLIP: f64 = 0.25;
+
+fn ok(c: &Clip) -> bool {
+    c.secs.is_finite() && c.secs >= MIN_CLIP
+}
 
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -40,7 +46,7 @@ pub fn seed(number: u32, slot_start: i64) -> u64 {
 }
 
 fn shuffled(pool: &[Clip], st: &mut u64) -> Vec<usize> {
-    let mut v: Vec<usize> = (0..pool.len()).filter(|&i| pool[i].secs > 0.0).collect();
+    let mut v: Vec<usize> = (0..pool.len()).filter(|&i| ok(&pool[i])).collect();
     let n = v.len();
     for i in (1..n).rev() {
         let j = (splitmix64(st) % (i as u64 + 1)) as usize;
@@ -101,12 +107,13 @@ impl Walker {
 /// Fills `gap_secs`: commercials (up to `break_secs`), then bumpers. The bool is true for commercials.
 pub fn fill_gap(gap_secs: f64, commercials: &[Clip], bumpers: &[Clip], break_secs: f64, seed: u64) -> Vec<(bool, Fill)> {
     let mut out = Vec::new();
-    if gap_secs < MIN_CUT {
+    if !gap_secs.is_finite() || gap_secs < MIN_CUT {
         return out;
     }
-    if !commercials.iter().chain(bumpers).any(|c| c.secs > 0.0) {
+    if !commercials.iter().chain(bumpers).any(ok) {
         return vec![(false, Fill::Card { secs: gap_secs })];
     }
+    let break_secs = if break_secs.is_finite() && break_secs > 0.0 { break_secs } else { 0.0 };
     let mut st = seed;
     let mut left = gap_secs;
 
@@ -132,6 +139,9 @@ pub fn fill_gap(gap_secs: f64, commercials: &[Clip], bumpers: &[Clip], break_sec
         } else {
             break;
         }
+    }
+    if left >= MIN_CUT {
+        out.push((false, Fill::Card { secs: left }));
     }
     out
 }
@@ -166,6 +176,9 @@ pub fn probe_line(line: &str) -> Option<(f64, u32, u32, bool)> {
         return None;
     }
     let secs: f64 = it.next()?.parse().ok()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
     let (w, h) = it.next()?.split_once('x')?;
     Some((secs, w.parse().ok()?, h.parse().ok()?, true))
 }
@@ -227,6 +240,31 @@ mod tests {
     }
 
     #[test]
+    fn fill_commercials_only_ends_with_card() {
+        let c = clips(&[15.0, 15.0]);
+        let f = fill_gap(600.0, &c, &[], 30.0, 5);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f[0].0 && f[1].0);
+        assert_eq!(f[2], (false, Fill::Card { secs: 570.0 }));
+    }
+
+    #[test]
+    fn fill_ignores_tiny_clip_and_bad_inputs() {
+        let tiny = clips(&[1e-300]);
+        assert_eq!(fill_gap(30.0, &[], &tiny, 0.0, 1), vec![(false, Fill::Card { secs: 30.0 })]);
+        let c = clips(&[10.0]);
+        let f = fill_gap(30.0, &c, &[], f64::NAN, 1);
+        assert_eq!(f, vec![(false, Fill::Card { secs: 30.0 })]);
+        assert!(fill_gap(f64::NAN, &c, &c, 30.0, 1).is_empty());
+        assert!(fill_gap(-5.0, &c, &c, 30.0, 1).is_empty());
+    }
+
+    #[test]
+    fn seed_pinned() {
+        assert_eq!(seed(7, 1767225600), 11528177788944388124);
+    }
+
+    #[test]
     fn seed_differs() {
         assert_ne!(seed(1, 1000), seed(2, 1000));
         assert_ne!(seed(1, 1000), seed(1, 2800));
@@ -262,5 +300,8 @@ mod tests {
         assert_eq!(probe_line("probe ok 12.480 1280x720 h264 aac"), Some((12.48, 1280, 720, true)));
         assert_eq!(probe_line("probe bad hevc"), None);
         assert_eq!(probe_line("hello"), None);
+        assert_eq!(probe_line("probe ok 5 12x"), None);
+        assert_eq!(probe_line("probe ok 0 12x12 h264 aac"), None);
+        assert_eq!(probe_line("probe ok NaN 12x12 h264 aac"), None);
     }
 }
