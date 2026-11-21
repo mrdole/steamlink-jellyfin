@@ -60,7 +60,7 @@ Versions and releases: [CHANGELOG.md](CHANGELOG.md), [docs/RELEASING.md](docs/RE
 
 - One program can use the Link's decoder at a time; pause = the player is stopped and restarted (about 3 s to
   picture on resume).
-- No volume control (use the TV), no program guide (Live TV shows what is on now), no seeking in Live TV.
+- No program guide (Live TV shows what is on now), no seeking in Live TV.
 - Only stereo audio; no surround passthrough.
 - Single-core 1 GHz CPU and ~256 MB RAM: the server does the heavy lifting.
 

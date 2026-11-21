@@ -50,6 +50,31 @@ fn sub_path(item: &str, index: i64) -> String {
     format!("/tmp/sljf-sub-{item}-{index}.srt")
 }
 const TICKS: f64 = 10_000_000.0; // Jellyfin ticks per second
+/// VolumeUp / VolumeDown step (volume is 0-100, sljf-play turns it into a gain)
+const VOLUME_STEP: u8 = 5;
+
+/// `volume` from config.json: 0-100, anything above is 100, missing or not a number = 100 (untouched).
+fn cfg_volume(v: &Value) -> u8 {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)).map(|x| x.clamp(0, 100) as u8).unwrap_or(100)
+}
+
+/// Jellyfin's remote volume commands: the new (volume, muted), or None for anything else.
+/// SetVolume's Arguments.Volume comes as a string ("40"); a number is taken too.
+fn volume_command(name: &str, args: &Value, vol: u8, muted: bool) -> Option<(u8, bool)> {
+    Some(match name {
+        "SetVolume" => {
+            let a = &args["Volume"];
+            let x = a.as_str().and_then(|s| s.trim().parse::<f64>().ok()).or_else(|| a.as_f64())?;
+            ((x.round() as i64).clamp(0, 100) as u8, muted)
+        }
+        "VolumeUp" => (vol.saturating_add(VOLUME_STEP).min(100), false),
+        "VolumeDown" => (vol.saturating_sub(VOLUME_STEP), muted),
+        "Mute" => (vol, true),
+        "Unmute" => (vol, false),
+        "ToggleMute" => (vol, !muted),
+        _ => return None,
+    })
+}
 const HOLD: &str = "/tmp/sljf.hold";
 const APP: &str = "/home/apps/jellyfin/run.sh";
 
@@ -68,6 +93,8 @@ struct Cfg {
     lan_port: u16,
     /// open the on-TV app once per boot, in place of the Link's menu (controller prompt)
     open_app_at_boot: bool,
+    /// start volume 0-100 for sljf-play (100 = untouched); a remote changes it until sljfd restarts
+    volume: u8,
 }
 
 impl Cfg {
@@ -89,6 +116,7 @@ impl Cfg {
                 .unwrap_or_default(),
             lan_port: v["lan_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(local::LAN_PORT),
             open_app_at_boot: v["open_app_at_boot"].as_bool().unwrap_or(false),
+            volume: cfg_volume(&v["volume"]),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
             return Err(format!("{path}: server, user_id and token are required (run sljf-login)"));
@@ -392,6 +420,8 @@ struct Player<'a> {
     auto_eps: u32,                  // episodes started by themselves since the last key press
     no_next: bool,                  // Back during the countdown: stop after this item
     next_label: Option<(usize, String)>, // queue index + "S3E6 Title" of the next item, for the countdown
+    volume: u8,                     // 0-100, from config.json, then the remote's SetVolume / VolumeUp / VolumeDown
+    muted: bool,
 }
 
 /// "Series · S3E5 Episode", "Film (1984)" or "11 Channel · Program" for the on-screen bar
@@ -479,6 +509,7 @@ impl<'a> Player<'a> {
             .env("SLJF_CA", &self.cfg.ca)
             .env("SLJF_UA", UA)
             .env("SLJF_AV_OFFSET_MS", self.cfg.av_offset_ms.to_string())
+            .env("SLJF_VOLUME", self.heard_volume().to_string())
             .stdin(Stdio::piped()) // "osd" lines: the on-screen bar
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -501,7 +532,7 @@ impl<'a> Player<'a> {
             "ItemId": n.item_id, "PlaySessionId": n.session,
             "MediaSourceId": n.live.as_ref().map(|l| l.ms_id.clone()).unwrap_or_else(|| n.item_id.clone()),
             "LiveStreamId": n.live.as_ref().map(|l| l.live_id.clone()),
-            "PositionTicks": n.pos_ticks, "IsPaused": n.paused, "IsMuted": false, "CanSeek": n.live.is_none(),
+            "PositionTicks": n.pos_ticks, "IsPaused": n.paused, "IsMuted": self.muted, "VolumeLevel": self.volume, "CanSeek": n.live.is_none(),
             "PlayMethod": if n.copy { "DirectStream" } else { "Transcode" }, "RepeatMode": "RepeatNone",
             "NowPlayingQueue": self.queue.iter().enumerate()
                 .map(|(i, id)| json!({"Id": id, "PlaylistItemId": format!("q{i}")})).collect::<Vec<_>>(),
@@ -902,6 +933,23 @@ impl<'a> Player<'a> {
         }
     }
 
+    /// The volume sljf-play plays at: 0 while muted.
+    fn heard_volume(&self) -> u8 {
+        if self.muted { 0 } else { self.volume }
+    }
+
+    /// A remote volume command: remember it (until sljfd restarts), tell the running sljf-play, report it.
+    fn set_volume(&mut self, name: &str, args: &Value) {
+        let Some((v, m)) = volume_command(name, args, self.volume, self.muted) else { return };
+        (self.volume, self.muted) = (v, m);
+        log(&format!("volume {v}{}", if m { " (muted)" } else { "" }));
+        let line = format!("volume {}\n", self.heard_volume());
+        if let Some(w) = self.now.as_mut().and_then(|n| n.child.as_mut()).and_then(|c| c.stdin.as_mut()) {
+            let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+        }
+        self.report("progress", Some("VolumeChange"));
+    }
+
     /// Paused: the bar on its own (`sljf-play --card`), with the paused position (or a seek target).
     fn show_card(&mut self) {
         if self.card.is_none() {
@@ -1076,6 +1124,7 @@ impl<'a> Player<'a> {
                     }
                 }
                 "Back" => self.shared.key("back"),
+                n @ ("SetVolume" | "VolumeUp" | "VolumeDown" | "Mute" | "Unmute" | "ToggleMute") => self.set_volume(n, &data["Arguments"]),
                 "SendString" => self.search_text(&local::search_text(data["Arguments"]["String"].as_str().unwrap_or(""))),
                 "GoHome" => {
                     // "home" on the remote also opens the app when the Link is showing its own menu
@@ -1275,7 +1324,8 @@ fn serve(p: &mut Player) -> Result<(), String> {
     p.api.post(
         "/Sessions/Capabilities/Full",
         &json!({"PlayableMediaTypes": ["Video"], "SupportedCommands": ["PlayState", "PlayNext", "PlayMediaSource", "MoveUp", "MoveDown", "MoveLeft",
-                                      "MoveRight", "Select", "Back", "GoHome", "SetAudioStreamIndex", "SetSubtitleStreamIndex", "SendString"],
+                                      "MoveRight", "Select", "Back", "GoHome", "SetAudioStreamIndex", "SetSubtitleStreamIndex", "SendString",
+                                      "SetVolume", "VolumeUp", "VolumeDown", "Mute", "Unmute", "ToggleMute"],
                 "SupportsMediaControl": true, "SupportsPersistentIdentifier": true}),
     )?;
     let ws_url = format!("{}/socket?deviceId={}", cfg.server.replacen("http", "ws", 1), cfg.device_id);
@@ -1378,6 +1428,7 @@ fn main() {
         cfg, api: Api::new(cfg), queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
         asked_audio: None, lang: cfg.audio_lang.clone(), asked_sub: None, sub_pref: SubPref::Default, cmds, sub_tx, sub_rx, shared,
         card: None, seek_to: None, sleep_at: None, auto_eps: 0, no_next: false, next_label: None,
+        volume: cfg.volume, muted: false,
     };
     let mut wait = 2;
     loop {
@@ -1398,5 +1449,46 @@ fn main() {
         // ("not valid yet"): keep trying every 2 s then, so the Link is back as soon as the time is right
         let clock_set = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() > 1_700_000_000).unwrap_or(false);
         wait = if clock_set { (wait * 2).min(60) } else { 2 };
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn config_volume_clamps() {
+        let v: Value = serde_json::from_str(r#"{"a": 40, "b": 150, "c": -3, "d": "x", "e": 37.6}"#).unwrap();
+        assert_eq!(cfg_volume(&v["a"]), 40);
+        assert_eq!(cfg_volume(&v["b"]), 100);
+        assert_eq!(cfg_volume(&v["c"]), 0);
+        assert_eq!(cfg_volume(&v["d"]), 100);
+        assert_eq!(cfg_volume(&v["e"]), 38);
+        assert_eq!(cfg_volume(&v["missing"]), 100);
+    }
+
+    #[test]
+    fn volume_steps() {
+        let none = Value::Null;
+        assert_eq!(volume_command("VolumeUp", &none, 40, false), Some((45, false)));
+        assert_eq!(volume_command("VolumeUp", &none, 98, false), Some((100, false)));
+        assert_eq!(volume_command("VolumeUp", &none, 40, true), Some((45, false)));
+        assert_eq!(volume_command("VolumeDown", &none, 40, false), Some((35, false)));
+        assert_eq!(volume_command("VolumeDown", &none, 3, false), Some((0, false)));
+        assert_eq!(volume_command("VolumeDown", &none, 40, true), Some((35, true)));
+    }
+
+    #[test]
+    fn set_volume_and_mute() {
+        let a = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        assert_eq!(volume_command("SetVolume", &a(r#"{"Volume": "40"}"#), 100, false), Some((40, false)));
+        assert_eq!(volume_command("SetVolume", &a(r#"{"Volume": 250}"#), 100, true), Some((100, true)));
+        assert_eq!(volume_command("SetVolume", &a(r#"{"Volume": "-1"}"#), 50, false), Some((0, false)));
+        assert_eq!(volume_command("SetVolume", &a(r#"{}"#), 50, false), None);
+        assert_eq!(volume_command("Mute", &Value::Null, 50, false), Some((50, true)));
+        assert_eq!(volume_command("Unmute", &Value::Null, 50, true), Some((50, false)));
+        assert_eq!(volume_command("ToggleMute", &Value::Null, 50, true), Some((50, false)));
+        assert_eq!(volume_command("ToggleMute", &Value::Null, 50, false), Some((50, true)));
+        assert_eq!(volume_command("Back", &Value::Null, 50, false), None);
     }
 }
