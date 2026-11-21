@@ -15,6 +15,7 @@
 //!   GET /key?k=up|down|left|right|select|back|home          inject a navigation key (tests)
 //!   GET /events?since=N            long poll (25 s): {seq, keys:[..], playing, paused, title, search,
 //!                                  after ("guide" | "home" | "": how playback last ended), channel (last Live TV id | null)}
+//!   GET /cache?f=NAME              stream a cached item (NAME or NAME.part while it is still downloading; no Range)
 //!   GET /text?q=TEXT               open Search with TEXT typed (tests; other machines use the LAN port below)
 //!
 //! LAN API (optional, off unless config `lan_allow` lists addresses): port `lan_port` (default 8098), only from those
@@ -418,6 +419,19 @@ fn handle(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, mut conn: TcpStre
     }
     let target = line.split_whitespace().nth(1).unwrap_or("/");
     let (path, q) = target.split_once('?').unwrap_or((target, ""));
+    if path == "/cache" {
+        // streamed (no Content-Length): the body grows while the fetcher downloads; local port only
+        let name = query(q, "f").unwrap_or_default();
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(30)));
+        let r = match crate::fetch::cache_dir() {
+            Some(dir) => crate::fetch::serve(&dir, &name, &|n| crate::fetch::state_of(n), &mut conn),
+            None => Err(404),
+        };
+        if let Err(code) = r {
+            let _ = conn.write_all(format!("HTTP/1.1 {code} Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+        }
+        return;
+    }
     let (code, ctype, body) = route(cfg, api, tx, sh, path, q);
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: {}\r\nConnection: close\r\n\r\n",

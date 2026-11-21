@@ -32,6 +32,8 @@ use tungstenite::{Message, WebSocket};
 
 #[allow(dead_code)] // not called from main until the channel engine lands
 mod filler;
+mod fetch;
+mod usb;
 mod guide;
 mod local;
 #[allow(dead_code)] // not called from main until the channel engine lands
