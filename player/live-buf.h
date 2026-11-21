@@ -11,10 +11,13 @@
 #ifndef SLJF_LIVE_BUF_H
 #define SLJF_LIVE_BUF_H
 
-#define LIVEBUF_AHEAD_S 12.0   /* the reader keeps reading while less than this is read ahead */
+#define LIVEBUF_AHEAD_S 12.0   /* the reader keeps reading while less than this is read ahead (default; SLJF_READAHEAD_S overrides) */
+#define LIVEBUF_AHEAD_MIN_S 1.0
+#define LIVEBUF_AHEAD_MAX_S 120.0
 #define LIVEBUF_DRY_S 0.7      /* picture stopped: video queue empty and no frame fed for this long */
 
-/* how far the reader may read ahead with a prebuffer of `prebuf` seconds */
+/* how far the reader may read ahead with a prebuffer of `prebuf` seconds: SLJF_READAHEAD_S (1..120, default 12;
+   unset, garbage or <= 0 = 12) or prebuf+1, whichever is larger */
 double livebuf_ahead(double prebuf);
 
 /* Picture watch. The decoder's queued-ms reads 0 while frames still come in just in time (the picture moves, a little

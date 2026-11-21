@@ -34,6 +34,9 @@
  *   env SLJF_PREBUFFER_MS  hold this much stream before feeding the decoders (Live TV: it arrives at real time on
  *                      average but unevenly, so without a cushion every hiccup empties the decoders = stutter). The
  *                      reader then keeps reading up to 12 s ahead (live-buf.h). 0 = off (files, default)
+ *   env SLJF_READAHEAD_S  how far the reader reads ahead (1-120 s, default 12; channels: sljfd sets 20 with a USB
+ *                      stick, 60 without). Each item's FIFO also stops at 32 MB of packets.
+ *   sljf-play --probe FILE  prints "probe ok <secs> <w>x<h> <vcodec> <acodec>" or "probe bad <why>" (no screen use)
  *   env SLJF_SUBS      SRT file: draw these subtitles on an SLVideo overlay (sljf-subs.c); SLJF_SUB_FONT the TTF
  *   env SLJF_STATIC    Live TV: show TV static (sljf-static.c) with a hiss at this volume (0-100 % of full scale,
  *                      0 = silent) while the stream opens and prebuffers and whenever the picture has stopped after
@@ -58,6 +61,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/channel_layout.h>
 #include <libswresample/swresample.h>
 #include <SLVideo.h>
@@ -131,6 +135,8 @@ static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 static double now_s(void);
 static int interrupt_cb(void *o) { struct item *it = o; return g_stop || (it && it->rd_quit); }   /* lets a blocked read end on stop */
 
+#define FIFO_BYTES_MAX (32L * 1024 * 1024)            /* and this many packet bytes per item: 1080p holds 14-18 MB at 12 s, the Link has ~100 MB */
+
 static double fifo_span(struct item *it) { return it->fifo_n ? it->last_ts - it->fifo_ts[it->fifo_head] : 0; }
 
 /* one packet into the FIFO (q_mu held) */
@@ -150,7 +156,7 @@ static void *reader(void *o) {
     AVPacket *pkt = av_packet_alloc();
     for (;;) {
         pthread_mutex_lock(&q_mu);
-        while (!it->rd_quit && !g_stop && (it->fifo_n >= FIFO_MAX || fifo_span(it) >= it->ahead)) {
+        while (!it->rd_quit && !g_stop && (it->fifo_n >= FIFO_MAX || it->bytes >= FIFO_BYTES_MAX || fifo_span(it) >= it->ahead)) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 100000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&q_cv, &q_mu, &ts);
@@ -459,9 +465,45 @@ static int card(void) {
     return 0;
 }
 
+/* --probe FILE: one line for sljfd (daemon: probe_line), no SLVideo/SLAudio, so it runs while another player owns the
+   screen. "probe ok <secs> <w>x<h> <vcodec> <acodec>" when the Link can play it (h264 8-bit up to 1920x1088, sound
+   aac/mp3/ac3 or none), else "probe bad <why>". Exit 0 either way (2 without a file). */
+static int probe(const char *path) {
+    av_log_set_level(AV_LOG_QUIET);
+    AVFormatContext *fmt = NULL;
+    AVDictionary *o = NULL;
+    av_dict_set(&o, "rw_timeout", "15000000", 0);
+    int err = avformat_open_input(&fmt, path, NULL, &o);
+    av_dict_free(&o);
+    if (err < 0) { printf("probe bad open: %s\n", av_err2str(err)); return 0; }
+    if ((err = avformat_find_stream_info(fmt, NULL)) < 0) { printf("probe bad no stream info: %s\n", av_err2str(err)); avformat_close_input(&fmt); return 0; }
+    int vi = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    int ai = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    double secs = fmt->duration > 0 ? fmt->duration / (double)AV_TIME_BASE : 0;
+    if (vi < 0) { puts("probe bad no video"); avformat_close_input(&fmt); return 0; }
+    AVCodecParameters *vp = fmt->streams[vi]->codecpar;
+    const char *vn = avcodec_get_name(vp->codec_id), *an = "none";
+    const AVPixFmtDescriptor *pd = vp->format >= 0 ? av_pix_fmt_desc_get((enum AVPixelFormat)vp->format) : NULL;
+    int deep = vp->bits_per_raw_sample > 8 || (pd && pd->comp[0].depth > 8) ||
+               (vp->codec_id == AV_CODEC_ID_H264 && (vp->profile == 110 || vp->profile == 122 || vp->profile == 244));
+    if (ai >= 0) an = avcodec_get_name(fmt->streams[ai]->codecpar->codec_id);
+    if (!(secs > 0)) puts("probe bad no duration");
+    else if (vp->codec_id != AV_CODEC_ID_H264) printf("probe bad video %s\n", vn);
+    else if (deep) puts("probe bad h264 not 8-bit");
+    else if (vp->width <= 0 || vp->height <= 0 || vp->width > 1920 || vp->height > 1088) printf("probe bad size %dx%d\n", vp->width, vp->height);
+    else if (ai >= 0 && strcmp(an, "aac") && strcmp(an, "mp3") && strcmp(an, "ac3")) printf("probe bad audio %s\n", an);
+    else printf("probe ok %.3f %dx%d %s %s\n", secs, vp->width, vp->height, vn, an);
+    avformat_close_input(&fmt);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--version")) { puts(SLJF_VERSION); return 0; }
-    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds] | --static [seconds] | --channel [seconds] | --card | --version\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds] | --static [seconds] | --channel [seconds] | --card | --probe <file> | --version\n"); return 2; }
+    if (!strcmp(argv[1], "--probe")) {
+        if (argc < 3) { fprintf(stderr, "usage: sljf-play --probe <file>\n"); return 2; }
+        return probe(argv[2]);
+    }
     if (!strcmp(argv[1], "--card")) {
         signal(SIGINT, on_signal); signal(SIGTERM, on_signal); setvbuf(stdout, NULL, _IOLBF, 0);
         return card();
