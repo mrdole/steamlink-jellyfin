@@ -30,6 +30,8 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+#[allow(dead_code)] // not called from main until the channel engine lands
+mod filler;
 mod guide;
 mod local;
 #[allow(dead_code)] // not called from main until the channel engine lands
