@@ -1,6 +1,6 @@
 [package]
 name = "sljfd"
-version = "0.1.0-alpha.1"   # = ../VERSION (scripts/bump-version sets both; CI checks)
+version = "0.1.0-alpha.2"   # = ../VERSION (scripts/bump-version sets both; CI checks)
 edition = "2024"
 
 [dependencies]

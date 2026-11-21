@@ -7,6 +7,8 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-11-20
+
 ### Fixed
 - Live TV stutter: network reads now run in their own thread. A read that waited for data (the server sending in
   bursts) stopped the player feeding the decoders, which ran dry with seconds of stream already read ahead (picture
@@ -32,5 +34,6 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
 - One release version (`VERSION`) used by the daemon, player, tools and Jellyfin device info; `scripts/check.sh`,
   `scripts/bump-version`, `scripts/release.sh`, CI.
 
-[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.1
