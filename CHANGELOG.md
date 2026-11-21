@@ -7,6 +7,11 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Fixed
+- Live TV stutter: network reads now run in their own thread. A read that waited for data (the server sending in
+  bursts) stopped the player feeding the decoders, which ran dry with seconds of stream already read ahead (picture
+  freezes, constant sync corrections). Status lines show `read max` and the per-stream read-ahead.
+
 ## [0.1.0-alpha.1] - 2026-11-20
 
 First public release. Early alpha: tested on one Steam Link against one Jellyfin server.
