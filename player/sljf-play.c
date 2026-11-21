@@ -377,7 +377,7 @@ int main(int argc, char **argv) {
         if (svol >= 0) {
             if (eof) static_hide();                   /* nothing more coming; its hiss would also keep aq > 0 */
             else if (st_play && !was_play) static_hide();
-            else if (static_visible()) { if (vq > 0 && vframes > st_frames) static_hide(); }
+            else if (static_visible()) { if (vframes >= st_frames + 3) static_hide(); }   /* frames flow again (vq may still read 0) */
             else if (stopped) { static_show(vctx, svol); st_frames = vframes; }
             static_tick(t);
         }
@@ -492,6 +492,9 @@ int main(int argc, char **argv) {
             if (v_first < 0 && pkt->pts != AV_NOPTS_VALUE) v_first = pkt->pts * av_q2d(vs->time_base) - vframes * fdur;
             if (pkt->dts != AV_NOPTS_VALUE) {                /* measure the real frame rate (see fdur above) */
                 double d = pkt->dts * av_q2d(vs->time_base);
+                /* timestamps went back (new segment) or jumped ahead (the server skipped part of the stream, seen
+                   2026-11-21 as "23.976 -> 9.163 fps" = slow motion): start over, before the jump is averaged in */
+                if (dts_n > 0 && (d < dts_ring[dts_n - 1] || d - dts_ring[dts_n - 1] > 0.5)) dts_n = 0;
                 if (dts_n == 60) {
                     double avg = (d - dts_ring[0]) / 60.0;
                     if (avg > 1.0 / 121 && avg < 0.2 && (avg - fdur > 0.03 * fdur || fdur - avg > 0.03 * fdur)) {
@@ -502,9 +505,6 @@ int main(int argc, char **argv) {
                         dts_n = 0;                            /* judge the new rate on 60 fresh frames, not again now */
                     } else { memmove(dts_ring, dts_ring + 1, 59 * sizeof(double)); dts_n = 59; }
                 }
-                /* timestamps went back (new segment) or jumped ahead (the server skipped part of the stream, seen
-                   2026-11-21 as "23.976 -> 9.163 fps" = slow motion): start over */
-                if (dts_n > 0 && (d < dts_ring[dts_n - 1] || d - dts_ring[dts_n - 1] > 0.5)) dts_n = 0;
                 dts_ring[dts_n++] = d;
             }
             if (bsf) {
