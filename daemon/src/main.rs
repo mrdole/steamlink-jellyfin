@@ -302,6 +302,12 @@ fn open_app_at_boot() {
     if std::path::Path::new(MARK).exists() {
         return;
     }
+    // only right after a boot: a daemon restarted later (deploy, crash) must not reopen the app after someone left it
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()
+        .and_then(|t| t.split_whitespace().next().and_then(|x| x.parse::<f64>().ok())).unwrap_or(0.0);
+    if uptime > 300.0 {
+        return;
+    }
     std::thread::spawn(|| {
         for _ in 0..180 {
             let up = Command::new("pidof").arg("shell").stdout(Stdio::null()).stderr(Stdio::null()).status()
