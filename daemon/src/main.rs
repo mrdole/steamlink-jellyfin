@@ -32,6 +32,8 @@ use tungstenite::{Message, WebSocket};
 
 mod guide;
 mod local;
+#[allow(dead_code)] // not called from main until the channel engine lands
+mod sched;
 
 /// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
