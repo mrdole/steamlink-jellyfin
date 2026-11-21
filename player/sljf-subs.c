@@ -282,14 +282,23 @@ static void draw_osd(uint32_t *px, int pitch) {
     g_osd_drawn = (long)pos;
 }
 
-static int draw_init(void) {
-    if (g_draw) return g_draw > 0 ? 0 : -1;
-    g_draw = -1;
+static int font_init(void) {
+    static int tried;
+    if (g_face) return 0;
+    if (tried) return -1;
+    tried = 1;
     const char *font = getenv("SLJF_SUB_FONT");
     if (!font) font = "/mnt/scratch/sljf/sub.ttf";
     if (FT_Init_FreeType(&g_ft) || FT_New_Face(g_ft, font, 0, &g_face)) {
-        if (FT_New_Face(g_ft, "/usr/share/fonts/NotoSans-Regular.ttf", 0, &g_face)) { printf("subs: no font\n"); return -1; }
+        if (FT_New_Face(g_ft, "/usr/share/fonts/NotoSans-Regular.ttf", 0, &g_face)) { g_face = NULL; printf("subs: no font\n"); return -1; }
     }
+    return 0;
+}
+
+static int draw_init(void) {
+    if (g_draw) return g_draw > 0 ? 0 : -1;
+    g_draw = -1;
+    if (font_init()) return -1;
     for (int i = 0; i < 2; i++) {
         g_ov[i] = SLVideo_CreateOverlay(g_vctx, SUB_W, SUB_H);
         if (!g_ov[i]) { printf("subs: SLVideo_CreateOverlay failed\n"); return -1; }
@@ -416,6 +425,32 @@ void subs_suspend(int on) {
         g_osd_left = 0;
         if (g_draw > 0 || osd_visible()) redraw();
     }
+}
+
+/* sljf-play --channel "next card": the card's text as a coverage mask of w x h bytes (the static's overlay, which it
+   is drawn on: the Link shows one overlay at a time, so the bar strip cannot show over the static), centred, at the
+   largest size up to h / 9 that fits. 0 ok, -1 no font (the mask stays empty) */
+int subs_text_mask(const char *text, uint8_t *mask, int w, int h) {
+    memset(mask, 0, (size_t)w * h);
+    if (font_init()) return -1;
+    const char *e = text + strlen(text);
+    int px = h / 9, tw = 0;
+    for (; px >= 8; px--) { FT_Set_Pixel_Sizes(g_face, 0, px); if ((tw = text_width(text, e)) <= w - 16) break; }
+    int cx = (w - tw) / 2, base = h / 2 + px * 3 / 8;
+    for (const char *p = text; p < e;) {
+        uint32_t c = utf8_next(&p);
+        if (FT_Load_Char(g_face, c, FT_LOAD_RENDER)) continue;
+        FT_GlyphSlot g = g_face->glyph;
+        for (int y = 0; y < (int)g->bitmap.rows; y++)
+            for (int x = 0; x < (int)g->bitmap.width; x++) {
+                int X = cx + g->bitmap_left + x, Y = base - g->bitmap_top + y;
+                if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+                uint8_t a = g->bitmap.buffer[y * g->bitmap.pitch + x];
+                if (a > mask[Y * w + X]) mask[Y * w + X] = a;
+            }
+        cx += (int)(g->advance.x >> 6);
+    }
+    return 0;
 }
 
 void subs_free(void) {

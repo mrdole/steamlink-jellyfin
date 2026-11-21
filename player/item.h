@@ -27,9 +27,13 @@ struct item {
     pthread_t rd_th;
     int threaded;                /* the reader thread runs */
     double limit_s;              /* play at most this long (0 = to the end) */
-    double first_ts;             /* stream time of the first packet */
+    double first_ts;             /* stream time of the first packet read */
+    long pushed;                 /* packets read into the FIFO so far */
+    int over;                    /* limit_s reached: nothing more of it is fed */
     int seq;                     /* position in the queue */
     int kind;                    /* 0 video, 1 card */
+    int w, h;                    /* video size (SLVideo stream: same size = same stream) */
+    double start_s;              /* where in the programme the stream starts (SLJF_START / "next v"), for the bar */
 };
 
 /* open the URL and probe its streams (blocks: the caller keeps the static moving); <0 = FFmpeg error, already
