@@ -22,6 +22,10 @@ old for modern HTTPS. `/mnt/scratch` and `/home` survive reboots; `/etc` is an o
   re-encoded to H.264 by the server; **audio always converted** to stereo AAC 48 kHz (most libraries have AC3/E-AC3
   5.1, and decoding that would eat the single core).
 - sljf-play keeps about 1 s queued in each output and prints one status line a second (`pos=`, queue levels, a-v).
+- **Live TV read-ahead**: with `SLJF_PREBUFFER_MS` (sljfd sets 3000 for Live TV) a reader thread keeps that much
+  (+1 s) read ahead in a FIFO and the main loop only feeds the decoders from it, so a network read that waits (a live
+  stream at its edge, a server sending in bursts) never holds up feeding. Status lines then add `ahead` (FIFO span,
+  per stream `v`/`a`, packets) and `read max` (longest read wait in that second). Files read inline.
 - **A/V sync**: SLVideo and SLAudio take no timestamps. Once a second the player compares where each output is (pts
   of the last submitted unit minus what is still queued) and inserts silence or drops samples. `av_offset_ms` adds a
   per-TV offset. The frame rate is re-measured from packet timestamps because the probed rate can be wrong.
