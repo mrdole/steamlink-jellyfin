@@ -7,6 +7,8 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-11-21
+
 ### Added
 - Home screen: the on-TV app now starts on three big tiles, JELLYFIN (the Jellyfin home as before), LIVE TV (the
   TV guide; left out when the server has no Live TV) and STEAM (back to the Link's own menu).
@@ -67,7 +69,8 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
 - One release version (`VERSION`) used by the daemon, player, tools and Jellyfin device info; `scripts/check.sh`,
   `scripts/bump-version`, `scripts/release.sh`, CI.
 
-[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.4...HEAD
+[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.5...HEAD
+[0.1.0-alpha.5]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.2
