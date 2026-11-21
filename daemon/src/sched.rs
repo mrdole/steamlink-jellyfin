@@ -57,7 +57,6 @@ const MIN_T: i64 = 1_577_836_800; // 2020-01-01T00:00:00Z
 const EPOCH_2026: i64 = 1_767_225_600;
 
 /// Epoch seconds of 2026-01-01 at the given local day start (e.g. 6 h = 21600) in a zone `utc_offset_secs` east of UTC.
-#[allow(dead_code)]
 pub fn epoch_for(day_start_local_secs: i64, utc_offset_secs: i64) -> i64 {
     EPOCH_2026 + day_start_local_secs - utc_offset_secs
 }
@@ -131,7 +130,6 @@ fn pad_on(ch: &ChannelDef, r: &Rules) -> bool {
 }
 
 /// Slots overlapping [from, until), simulated fresh from the epoch.
-#[allow(dead_code)]
 pub fn slots(ch: &ChannelDef, r: &Rules, from: i64, until: i64) -> Vec<Slot> {
     let mut out = Vec::new();
     if from >= until || until <= r.epoch {
@@ -147,14 +145,14 @@ pub fn slots(ch: &ChannelDef, r: &Rules, from: i64, until: i64) -> Vec<Slot> {
     out
 }
 
-/// Fresh computation: replay from the epoch until the slot containing t.
+/// Replay from `c` until the slot containing t. Returns the slot, the offset into it and the cursor just
+/// after it (no cloning per step: the caller clones once if it wants to keep it).
 fn now_from(mut c: Cursor, ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64, Cursor)> {
     loop {
-        let before = c.clone();
         let s = c.step(ch, r);
         if t < s.end {
             let off = t - s.start;
-            return Some((s, off, before));
+            return Some((s, off, c));
         }
     }
 }
@@ -164,7 +162,6 @@ fn valid_t(r: &Rules, t: i64) -> bool {
 }
 
 /// The slot on air at t and how many seconds into it t is; None on an empty channel or before the epoch / a set clock.
-#[allow(dead_code)]
 pub fn now(ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64)> {
     if !valid_t(r, t) {
         return None;
@@ -175,13 +172,12 @@ pub fn now(ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64)> {
 /// Per-channel cursor cache for the daemon's polling: asking for a later t resumes from the last answer.
 /// The key is the channel number plus epoch and padding mode; a rebuilt channel (different shows) must call
 /// `forget` so a stale cursor is not reused.
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct Scheduler {
+    /// Value: (end of the last answered slot, cursor just after it).
     cache: Mutex<HashMap<(u32, i64, bool), (i64, Cursor)>>,
 }
 
-#[allow(dead_code)]
 impl Scheduler {
     pub fn now(&self, ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64)> {
         if !valid_t(r, t) {
@@ -193,8 +189,8 @@ impl Scheduler {
             Some((from_t, c)) if *from_t <= t => c.clone(),
             _ => Cursor::new(ch, r)?,
         };
-        let (s, off, before) = now_from(start, ch, r, t)?;
-        cache.insert(key, (s.start, before));
+        let (s, off, after) = now_from(start, ch, r, t)?;
+        cache.insert(key, (s.end, after));
         Some((s, off))
     }
 
@@ -339,6 +335,58 @@ mod tests {
         // going backwards falls back to a fresh run
         assert_eq!(sch.now(&ch, &r, t1), now(&ch, &r, t1));
         assert_eq!(sch.now(&ch, &r, t2 + 1), now(&ch, &r, t2 + 1));
+    }
+
+    fn order_of(ch: &ChannelDef, round: u64) -> String {
+        round_order(ch, round).iter().map(|&i| ch.shows[i].id.as_str()).collect()
+    }
+
+    #[test]
+    fn golden_round_order() {
+        let ch = chan(["a", "b", "c", "d", "e"].iter().map(|i| show(i, 2, 1200)).collect(), true);
+        assert_eq!(order_of(&ch, 0), "cbdae");
+        assert_eq!(order_of(&ch, 1), "deabc");
+        // input order of the shows does not matter
+        let rev = chan(["e", "c", "a", "d", "b"].iter().map(|i| show(i, 2, 1200)).collect(), true);
+        assert_eq!(order_of(&rev, 0), order_of(&ch, 0));
+        assert_eq!(order_of(&rev, 1), order_of(&ch, 1));
+    }
+
+    #[test]
+    fn slot_edges() {
+        let (ch, r) = (three(), rules());
+        let v = slots(&ch, &r, EPOCH, EPOCH + 86_400);
+        let s = &v[3];
+        let (last, off) = now(&ch, &r, s.end - 1).unwrap();
+        assert_eq!((&last, off), (s, s.end - 1 - s.start));
+        let (next, off) = now(&ch, &r, s.end).unwrap();
+        assert_eq!((&next, off), (&v[4], 0));
+        let (first, off) = now(&ch, &r, EPOCH).unwrap();
+        assert_eq!((&first, off), (&v[0], 0));
+    }
+
+    #[test]
+    fn single_show_single_ep_repeats() {
+        let ch = chan(vec![show("a", 1, 1320)], true);
+        let v = slots(&ch, &rules(), EPOCH, EPOCH + 86_400);
+        assert!(v.len() > 40);
+        assert!(v.iter().all(|s| s.ep == 0 && s.show == 0));
+    }
+
+    #[test]
+    fn cursor_matches_fresh_at_edges_and_after_forget() {
+        let sch = Scheduler::default();
+        let (ch, r) = (three(), rules());
+        let v = slots(&ch, &r, EPOCH, EPOCH + 3 * 86_400);
+        for s in v.iter().step_by(7) {
+            for t in [s.start, s.end - 1, s.end] {
+                assert_eq!(sch.now(&ch, &r, t), now(&ch, &r, t), "t={t}");
+            }
+        }
+        sch.forget(ch.number);
+        let t = v[20].end;
+        assert_eq!(sch.now(&ch, &r, t), now(&ch, &r, t));
+        assert_eq!(sch.now(&ch, &r, t + 1), now(&ch, &r, t + 1));
     }
 
     #[test]
