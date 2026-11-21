@@ -7,6 +7,11 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Added
+- `open_app_at_boot` (config, off by default): the on-TV app opens by itself after the Link starts, in place of the
+  Link's "connect a controller" menu, so a Link without a controller can be used from the Jellyfin or Home Assistant
+  remote right away.
+
 ## [0.1.0-alpha.2] - 2026-11-20
 
 ### Fixed

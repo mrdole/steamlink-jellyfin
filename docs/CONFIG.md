@@ -29,6 +29,7 @@ Example with every key: [examples/config.example.json](../examples/config.exampl
 |---|---|---|
 | `lan_allow` | `[]` (off) | IP addresses allowed to use the [LAN API](integrations/lan-api.md). Empty = the LAN port is not opened |
 | `lan_port` | `8098` | Port for the LAN API |
+| `open_app_at_boot` | `false` | Open the on-TV app after the Link starts, in place of its menu ("connect a controller" prompt). Handy without a controller: the Jellyfin remote / Home Assistant then drives the app. Once per boot; leaving the app shows the Link's menu as usual |
 
 Integrations that need no config on the Link: the Jellyfin apps and [Home Assistant](integrations/home-assistant.md)
 (both talk to the Link through your Jellyfin server), [keyboard and game controllers](integrations/input.md).

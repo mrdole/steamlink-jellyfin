@@ -16,6 +16,7 @@
 //! config.json: {"server","user_id","token","device_id","device_name","av_offset_ms","player","ca","audio_lang"}  (mode 600)
 //!   audio_lang: ISO 639-2 language used to pick the audio track when the Jellyfin user has no preference (default eng)
 //!   lan_allow, lan_port: optional LAN API (docs/integrations/lan-api.md); off while lan_allow is empty
+//!   open_app_at_boot: open the on-TV app once the Link's menu is up after a boot (default false)
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -65,6 +66,8 @@ struct Cfg {
     /// who may use the optional LAN API (local::lan_start); empty = LAN API off
     lan_allow: Vec<String>,
     lan_port: u16,
+    /// open the on-TV app once per boot, in place of the Link's menu (controller prompt)
+    open_app_at_boot: bool,
 }
 
 impl Cfg {
@@ -85,6 +88,7 @@ impl Cfg {
             lan_allow: v["lan_allow"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default(),
             lan_port: v["lan_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(local::LAN_PORT),
+            open_app_at_boot: v["open_app_at_boot"].as_bool().unwrap_or(false),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
             return Err(format!("{path}: server, user_id and token are required (run sljf-login)"));
@@ -286,6 +290,41 @@ fn take_screen() {
     sh(&format!(
         "touch {HOLD}; echo 'while [ -e {HOLD} ]; do sleep 1; done' >/tmp/launch_cmdline.txt; killall shell; sleep 2"
     ));
+}
+/// Show the on-TV app in place of the Link's menu (same launcher route as take_screen); no-op if it is open.
+fn open_app() {
+    sh(&format!("pidof sljf-ui >/dev/null || {{ [ -x {APP} ] && echo {APP} >/tmp/launch_cmdline.txt && killall shell; }}"));
+}
+/// open_app_at_boot: wait for the Link's menu (`shell`) to come up, then open the app once per boot.
+/// /tmp is a tmpfs, so the marker is gone after a reboot; a daemon restart (deploy, crash) does not reopen it.
+fn open_app_at_boot() {
+    const MARK: &str = "/tmp/sljf.app-at-boot";
+    if std::path::Path::new(MARK).exists() {
+        return;
+    }
+    // only right after a boot: a daemon restarted later (deploy, crash) must not reopen the app after someone left it
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()
+        .and_then(|t| t.split_whitespace().next().and_then(|x| x.parse::<f64>().ok())).unwrap_or(0.0);
+    if uptime > 300.0 {
+        return;
+    }
+    std::thread::spawn(|| {
+        for _ in 0..180 {
+            let up = Command::new("pidof").arg("shell").stdout(Stdio::null()).stderr(Stdio::null()).status()
+                .map(|s| s.success()).unwrap_or(false);
+            if up {
+                std::thread::sleep(Duration::from_secs(3)); // let the menu finish starting
+                if !std::path::Path::new(HOLD).exists() {
+                    let _ = std::fs::write(MARK, "");
+                    log("open_app_at_boot: opening the app");
+                    open_app();
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        log("open_app_at_boot: the Link's menu did not come up in 3 min, app not opened");
+    });
 }
 fn release_screen() {
     let _ = std::fs::remove_file(HOLD);
@@ -1041,7 +1080,7 @@ impl<'a> Player<'a> {
                 "GoHome" => {
                     // "home" on the remote also opens the app when the Link is showing its own menu
                     if self.now.is_none() {
-                        sh(&format!("pidof sljf-ui >/dev/null || {{ [ -x {APP} ] && echo {APP} >/tmp/launch_cmdline.txt && killall shell; }}"));
+                        open_app();
                     }
                     self.shared.key("home")
                 }
@@ -1061,7 +1100,7 @@ impl<'a> Player<'a> {
             return log(&format!("search \"{t}\": ignored, something is playing"));
         }
         log(&format!("search \"{t}\""));
-        sh(&format!("pidof sljf-ui >/dev/null || {{ [ -x {APP} ] && echo {APP} >/tmp/launch_cmdline.txt && killall shell; }}"));
+        open_app();
         self.shared.search(t);
     }
 
@@ -1331,6 +1370,9 @@ fn main() {
         local::lan_start(cfg, tx.clone());
     }
     local::start(cfg, tx, shared.clone());
+    if cfg.open_app_at_boot {
+        open_app_at_boot();
+    }
     shared.set_lang(&cfg.audio_lang);
     let mut p = Player {
         cfg, api: Api::new(cfg), queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
