@@ -7,6 +7,8 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.6] - 2026-11-21
+
 ### Fixed
 - Live TV static flashing on and off more and more the longer a channel played: once the stream ran behind, the
   player fed each packet as it came and the static went up whenever the decoder's queue read empty, although the
@@ -76,7 +78,8 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
 - One release version (`VERSION`) used by the daemon, player, tools and Jellyfin device info; `scripts/check.sh`,
   `scripts/bump-version`, `scripts/release.sh`, CI.
 
-[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.5...HEAD
+[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.6...HEAD
+[0.1.0-alpha.6]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.6
 [0.1.0-alpha.5]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.3
