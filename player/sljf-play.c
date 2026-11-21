@@ -25,13 +25,11 @@
  *   env SLJF_START     where in the item the stream starts (seconds; Jellyfin's StartTimeTicks), for subtitle timing
  *   env SLJF_PREBUFFER_MS  hold this much stream before feeding the decoders (Live TV: it arrives at real time on
  *                      average but unevenly, so without a cushion every hiccup empties the decoders = stutter). The
- *                      reader then keeps reading up to 12 s ahead, and when the picture runs dry anyway the player
- *                      holds the decoders back until a bigger cushion is in (5, 7, then 8 s; "rebuffering",
- *                      "rebuffered", live-buf.h). 0 = off (files, default)
+ *                      reader then keeps reading up to 12 s ahead (live-buf.h). 0 = off (files, default)
  *   env SLJF_SUBS      SRT file: draw these subtitles on an SLVideo overlay (sljf-subs.c); SLJF_SUB_FONT the TTF
  *   env SLJF_STATIC    Live TV: show TV static (sljf-static.c) with a hiss at this volume (0-100 % of full scale,
  *                      0 = silent) while the stream opens and prebuffers and whenever the picture has stopped after
- *                      it started (video queue empty and no frame fed for 700 ms, then held for the rebuffer);
+ *                      it started (video queue empty and no frame fed for 700 ms);
  *                      prints "static on" / "static off". Unset: no static
  *                      (films, episodes: as without this feature). Subtitles and the bar are not drawn under it.
  *   env SLJF_VOLUME    0-100 (default 100 = untouched): software volume, the Link itself always sends full-scale
@@ -349,8 +347,6 @@ int main(int argc, char **argv) {
     int started = 0, low_logged = 0;
     double prebuf = getenv("SLJF_PREBUFFER_MS") ? atof(getenv("SLJF_PREBUFFER_MS")) / 1000.0 : 0;
     double fifo_low = 1e9;                            /* smallest read-ahead since the last status line */
-    double target = prebuf;                          /* cushion to hold for before feeding (grows per run-out) */
-    int rebuffers = 0; double hold_t0 = 0;
     g_fmt = fmt; g_ahead = livebuf_ahead(prebuf);
     pthread_t rd_th; int threaded = 0;
     if (prebuf > 0) {
@@ -372,24 +368,16 @@ int main(int argc, char **argv) {
         double vfed = v_acc + (vframes - n_base) * fdur;     /* seconds of video handed to the decoder */
         uint32_t vq = SLVideo_GetQueuedVideoMS(vstr);
         uint32_t aq = astr ? SLAudio_GetQueuedAudioSamples(astr) * 1000 / AUDIO_RATE : 0;
-        /* Live TV: the picture has stopped when the video queue is empty and no frame went in for 700 ms (the
-           queue reads 0 while frames come in just in time; that is moving picture, not a reason for static). Then
-           the player stops feeding and holds until a bigger cushion is read ahead (live-buf.h): one longer static
-           instead of flashes every few seconds while the stream keeps arriving just in time */
+        /* TV static: off once the first frame is on screen; on again when the picture has stopped (video queue
+           empty and no frame fed for 700 ms: the queue reads 0 while frames come in just in time, which is moving
+           picture and flashed the static every few seconds, 2026-11-21), off when frames come in again */
         int was_play = st_play;
         if (!st_play && v_first >= 0 && vfed - vq / 1000.0 > 0.2) st_play = 1;
         int stopped = was_play && !eof && picwatch_stopped(&pw, vq, vframes, started, t);
-        if (stopped && prebuf > 0) {
-            target = livebuf_target(prebuf, ++rebuffers);
-            pthread_mutex_lock(&q_mu); g_ahead = livebuf_ahead(target); pthread_cond_signal(&q_cv); pthread_mutex_unlock(&q_mu);
-            printf("rebuffering (%d): picture ran dry, holding until %.1f s are read ahead\n", rebuffers, target);
-            started = 0; hold_t0 = t;
-        }
-        /* TV static: off once the first frame is on screen; on when the picture stopped, off when frames come in */
         if (svol >= 0) {
             if (eof) static_hide();                   /* nothing more coming; its hiss would also keep aq > 0 */
             else if (st_play && !was_play) static_hide();
-            else if (static_visible()) { if (started && vq > 0 && vframes > st_frames) static_hide(); }
+            else if (static_visible()) { if (vq > 0 && vframes > st_frames) static_hide(); }
             else if (stopped) { static_show(vctx, svol); st_frames = vframes; }
             static_tick(t);
         }
@@ -482,10 +470,9 @@ int main(int argc, char **argv) {
         pthread_mutex_lock(&q_mu);
         double span = fifo_span();
         if (!started) {
-            if (span >= target || eof || fifo_n == FIFO_MAX) {
+            if (span >= prebuf || eof || fifo_n == FIFO_MAX) {
                 started = 1;
-                if (rebuffers) printf("rebuffered %.1f s in %.1f s\n", span, now_s() - hold_t0);
-                else if (prebuf > 0) printf("prebuffered %.1f s in %.1f s\n", span, now_s() - start);
+                if (prebuf > 0) printf("prebuffered %.1f s in %.1f s\n", span, now_s() - start);
             } else { pthread_mutex_unlock(&q_mu); if (threaded) usleep(5000); continue; }
         }
         if (prebuf > 0 && fifo_n) {
@@ -512,10 +499,12 @@ int main(int argc, char **argv) {
                         printf("frame rate %.3f -> %.3f fps\n", 1 / fdur, 1 / avg);
                         fdur = avg;
                         SLVideo_SetStreamTargetFramerate(vstr, (int)(1000.0 / avg + 0.5), 1000);
-                    }
-                    memmove(dts_ring, dts_ring + 1, 59 * sizeof(double)); dts_n = 59;
+                        dts_n = 0;                            /* judge the new rate on 60 fresh frames, not again now */
+                    } else { memmove(dts_ring, dts_ring + 1, 59 * sizeof(double)); dts_n = 59; }
                 }
-                if (dts_n > 0 && d < dts_ring[dts_n - 1]) dts_n = 0;   /* timestamps went back (new segment): start over */
+                /* timestamps went back (new segment) or jumped ahead (the server skipped part of the stream, seen
+                   2026-11-21 as "23.976 -> 9.163 fps" = slow motion): start over */
+                if (dts_n > 0 && (d < dts_ring[dts_n - 1] || d - dts_ring[dts_n - 1] > 0.5)) dts_n = 0;
                 dts_ring[dts_n++] = d;
             }
             if (bsf) {
@@ -580,7 +569,7 @@ int main(int argc, char **argv) {
     subs_free();                                      /* subtitles and the bar */
     if (astr) SLAudio_FreeStream(astr);
     if (actx) SLAudio_FreeContext(actx);
-    SLVideo_FreeStream(vstr);
+    if (vstr) SLVideo_FreeStream(vstr);
     SLVideo_FreeContext(vctx);
     swr_free(&swr); avcodec_free_context(&adec); av_bsf_free(&bsf);
     av_frame_free(&afr); av_packet_free(&pkt); av_packet_free(&fpkt);
