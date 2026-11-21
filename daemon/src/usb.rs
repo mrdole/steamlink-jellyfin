@@ -97,7 +97,7 @@ pub fn poll(state: &mut Option<Stick>) {
         }
         aux.rejected = false;
         aux.polls = 0;
-        crate::fetch::set_cache_off(false); // a re-insert re-enables the cache
+        crate::fetch::set_cache_off(true); // no stick: nothing may be written (re-enabled by the next good mount)
         return;
     }
     if let Some(s) = state.as_mut() {
@@ -120,6 +120,7 @@ pub fn poll(state: &mut Option<Stick>) {
             None => {
                 log("usb: stick present but not mountable (vfat/ext2/3/4 only)");
                 aux.rejected = true;
+                crate::fetch::set_cache_off(true);
                 return;
             }
         },
@@ -129,11 +130,13 @@ pub fn poll(state: &mut Option<Stick>) {
         log("usb: stick has no sljf/ folder, ignored");
         umount(false);
         aux.rejected = true;
+        crate::fetch::set_cache_off(true);
         return;
     }
     let free = free_bytes().unwrap_or(0);
     log(&format!("usb: stick mounted ({ty}, {} MB free)", free / 1_000_000));
     aux.polls = 0;
+    crate::fetch::on_mount(&root.join("cache")); // retry failed jobs, drop orphaned .part files
     crate::fetch::set_cache_off(false);
     *state = Some(Stick { root, free_bytes: free, fat: ty == "vfat" });
 }
@@ -147,7 +150,8 @@ pub fn cache_budget(free_bytes: u64, cache_gb: Option<u32>) -> u64 {
 }
 
 /// Picks the oldest (mtime) files that are not in use until the rest fits `budget`; removes them from `files` and
-/// returns their names (the caller deletes them).
+/// returns their names (the caller deletes them). The caller must put the item currently playing from /cache into
+/// `in_use` (the fetcher's `wanted()` only lists queued and downloading files).
 pub fn evict(files: &mut Vec<(String, u64, u64)>, budget: u64, in_use: &[String]) -> Vec<String> {
     let mut total: u64 = files.iter().map(|f| f.1).sum();
     if total <= budget {

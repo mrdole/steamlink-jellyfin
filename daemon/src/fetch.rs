@@ -4,7 +4,7 @@ use crate::{UA, log};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,8 @@ pub const FAT_MAX: u64 = 3_900_000_000;
 const CHUNK: usize = 64 * 1024;
 /// How long /cache waits for a file the fetcher says it is working on to show up.
 const APPEAR_WAIT: Duration = Duration::from_secs(5);
+/// A Growing file with no new bytes for this long ends the /cache stream (a stalled download).
+const IDLE_LIMIT: Duration = Duration::from_secs(60);
 const STEP: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,14 +58,16 @@ fn cache_dir_cell() -> &'static Mutex<Option<PathBuf>> {
     D.get_or_init(Default::default)
 }
 
-static CACHE_OFF: AtomicBool = AtomicBool::new(false);
+/// On only while a stick with sljf/ is mounted (usb::poll); off at start, so nothing is written to internal flash.
+static CACHE_OFF: AtomicBool = AtomicBool::new(true);
 
 /// Where the fetcher writes (None until a Fetcher exists / after the stick went).
 pub fn cache_dir() -> Option<PathBuf> {
     cache_dir_cell().lock().unwrap().clone()
 }
 
-/// Set after a write error (cache off until the stick is re-inserted); usb::poll clears it.
+/// Off while the stick is absent or rejected and after a write error (until the stick is re-inserted); usb::poll
+/// turns it on after a successful mount.
 pub fn set_cache_off(off: bool) {
     CACHE_OFF.store(off, Ordering::SeqCst);
 }
@@ -103,6 +107,11 @@ fn http_head(code: u16) -> String {
 /// ending once it is Complete. Writes the 200 head itself; on Err(404) nothing was written (the caller answers).
 /// No Content-Length: the body ends when the connection closes. Returns the body bytes sent.
 pub fn serve(dir: &Path, name: &str, state: &dyn Fn(&str) -> FileState, out: &mut dyn Write) -> Result<u64, u16> {
+    serve_with(dir, name, state, out, IDLE_LIMIT)
+}
+
+/// `serve` with the no-growth limit injectable: a Growing file that gets no new bytes for `idle` ends the stream.
+pub fn serve_with(dir: &Path, name: &str, state: &dyn Fn(&str) -> FileState, out: &mut dyn Write, idle: Duration) -> Result<u64, u16> {
     if !valid_name(name) {
         return Err(404);
     }
@@ -129,6 +138,7 @@ pub fn serve(dir: &Path, name: &str, state: &dyn Fn(&str) -> FileState, out: &mu
     }
     let mut sent = 0u64;
     let mut buf = vec![0u8; CHUNK];
+    let mut last_growth = Instant::now();
     loop {
         let st = state(name); // read before the file so data written just before it flipped is not missed
         let n = file.read(&mut buf).unwrap_or(0);
@@ -137,10 +147,12 @@ pub fn serve(dir: &Path, name: &str, state: &dyn Fn(&str) -> FileState, out: &mu
                 return Ok(sent); // client went away
             }
             sent += n as u64;
+            last_growth = Instant::now();
             continue;
         }
         match st {
-            FileState::Growing => std::thread::sleep(STEP),
+            FileState::Growing if last_growth.elapsed() < idle => std::thread::sleep(STEP),
+            FileState::Growing => return Ok(sent), // stalled
             _ => return Ok(sent), // Complete, or failed/cancelled: the stream just ends
         }
     }
@@ -163,6 +175,8 @@ struct Inner {
     dir: PathBuf,
     headers: String,
     agent: ureq::Agent,
+    /// Largest file the stick can hold (FAT_MAX on FAT, else unlimited).
+    max_file: AtomicU64,
 }
 
 pub struct Fetcher {
@@ -174,6 +188,8 @@ enum End {
     Cancelled,
     /// Network / HTTP trouble: this job failed, the cache is fine.
     Net(String),
+    /// Too big for this stick (FAT): this job only is skipped.
+    TooBig,
     /// Could not write to the stick: cache off until re-insert.
     Disk(String),
 }
@@ -181,32 +197,39 @@ enum End {
 impl Fetcher {
     /// `headers` is the Authorization header value (cfg.auth()).
     pub fn new(cache_dir: PathBuf, headers: String) -> Fetcher {
-        let _ = std::fs::create_dir_all(&cache_dir);
         *cache_dir_cell().lock().unwrap() = Some(cache_dir.clone());
         // Same agent construction as Api in main.rs (webpki roots via rustls, the Link's system CAs are too old);
-        // no global timeout: items are gigabytes long.
+        // no global timeout (items are gigabytes long), but a stalled read times out after 30 s.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_per_read(Some(Duration::from_secs(30)))
             .timeout_global(None)
             .http_status_as_error(false)
             .user_agent(UA)
             .build()
             .into();
-        let inner = Arc::new(Inner { q: Mutex::new(Queue::default()), cv: Condvar::new(), dir: cache_dir, headers, agent });
+        let inner = Arc::new(Inner { q: Mutex::new(Queue::default()), cv: Condvar::new(), dir: cache_dir, headers, agent, max_file: AtomicU64::new(u64::MAX) });
         let w = inner.clone();
         std::thread::spawn(move || worker(&w));
         Fetcher { inner }
     }
 
+    /// Largest file the stick takes: `FAT_MAX` for a FAT stick, `u64::MAX` otherwise. Bigger items are skipped
+    /// (state Failed for that job only, the cache stays on) and played direct.
+    pub fn set_max_file(&self, max: u64) {
+        self.inner.max_file.store(max, Ordering::SeqCst);
+    }
+
     /// Replaces the queue (a flip drops the old channel's jobs); cancels the active download if it is not in `jobs`.
+    /// The caller must keep the item currently playing from /cache in `in_use` for `usb::evict` (`wanted()` does not
+    /// list it once its download is done).
     pub fn want(&self, jobs: Vec<Job>) {
         let mut q = self.inner.q.lock().unwrap();
-        if let Some(a) = &q.active {
-            if !jobs.iter().any(|j| &j.name == a) {
-                q.cancel = true;
-            }
-        }
+        q.cancel = match &q.active {
+            Some(a) => !jobs.iter().any(|j| &j.name == a),
+            None => false,
+        };
         let active = q.active.clone();
         q.jobs = jobs.into_iter().filter(|j| Some(&j.name) != active.as_ref()).collect();
         self.inner.cv.notify_all();
@@ -247,6 +270,9 @@ fn run_job(inner: &Inner, job: &Job) {
     if !valid_name(&job.name) {
         return;
     }
+    if cache_off() || !dir_ready(&inner.dir) {
+        return; // no verified stick: never write (the caller wants it again later)
+    }
     let full = inner.dir.join(&job.name);
     let part = inner.dir.join(format!("{}.part", job.name));
     if full.is_file() {
@@ -271,7 +297,62 @@ fn run_job(inner: &Inner, job: &Job) {
             let _ = std::fs::remove_file(&part);
             set_state(&job.name, FileState::Failed);
         }
+        End::TooBig => {
+            log(&format!("fetch: {} too big for FAT, played direct", job.name));
+            let _ = std::fs::remove_file(&part);
+            set_state(&job.name, FileState::Failed);
+        }
         End::Disk(e) => disk_failed(&job.name, &part, &e),
+    }
+}
+
+/// EFBIG: the file hit the filesystem's size limit (a per-job problem, not a broken stick).
+fn is_efbig(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(27)
+}
+
+/// True when an item of (announced) size `len` cannot be cached under `max`.
+pub fn too_big(len: Option<u64>, max: u64) -> bool {
+    len.is_some_and(|l| l > max)
+}
+
+/// The stick is mounted when MOUNT's device differs from its parent directory's (/mnt tmpfs).
+pub fn on_stick(mount_dev: u64, parent_dev: u64) -> bool {
+    mount_dev != parent_dev
+}
+
+/// `dir` (MOUNT/sljf/cache) may be written: MOUNT is a real mount and `dir`'s parent (sljf/) exists on it.
+/// Creates only the cache/ subdir itself, never anything above it.
+fn dir_ready(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mount = Path::new(crate::usb::MOUNT);
+    let dev = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+    let (Some(md), Some(pd)) = (dev(mount), mount.parent().and_then(dev)) else { return false };
+    if !on_stick(md, pd) {
+        return false;
+    }
+    let Some(parent) = dir.parent() else { return false };
+    if dev(parent) != Some(md) || !parent.is_dir() {
+        return false;
+    }
+    dir.is_dir() || std::fs::create_dir(dir).is_ok()
+}
+
+/// A stick was mounted: forget failed jobs (retry them) and delete orphaned .part files from an interrupted run.
+pub fn on_mount(dir: &Path) {
+    clear_failed();
+    remove_orphan_parts(dir);
+}
+
+pub fn clear_failed() {
+    registry().lock().unwrap().retain(|_, s| *s != FileState::Failed);
+}
+
+pub fn remove_orphan_parts(dir: &Path) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().ends_with(".part") {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -296,6 +377,9 @@ fn download(inner: &Inner, job: &Job, part: &Path) -> End {
         return End::Net(format!("http {code}"));
     }
     let expect: Option<u64> = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|s| s.parse().ok());
+    if too_big(expect, inner.max_file.load(Ordering::SeqCst)) {
+        return End::TooBig;
+    }
     let mut body = resp.into_body();
     let mut rd = body.as_reader();
     let mut f = match std::fs::File::create(part) {
@@ -314,8 +398,11 @@ fn download(inner: &Inner, job: &Job, part: &Path) -> End {
             Ok(n) => n,
             Err(e) => return End::Net(e.to_string()),
         };
+        if total + n as u64 > inner.max_file.load(Ordering::SeqCst) {
+            return End::TooBig; // length was not announced
+        }
         if let Err(e) = f.write_all(&buf[..n]) {
-            return End::Disk(e.to_string());
+            return if is_efbig(&e) { End::TooBig } else { End::Disk(e.to_string()) };
         }
         total += n as u64;
         // keep bytes/elapsed <= cap, checking cancel while we wait
@@ -423,6 +510,48 @@ mod tests {
         assert!(!s.contains("Content-Length"));
         assert!(s.contains("Connection: close"));
         assert!(s.ends_with("hello world"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cache_serve_stalled_growing_file_ends() {
+        let d = tmp("stall");
+        std::fs::write(d.join("s.ts.part"), b"abc").unwrap();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        let r = serve_with(&d, "s.ts", &|_| FileState::Growing, &mut out, Duration::from_millis(400));
+        assert_eq!(r, Ok(3));
+        assert!(t.elapsed() < Duration::from_secs(3));
+        assert!(out.ends_with(b"abc"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fat_size_decision() {
+        assert!(too_big(Some(FAT_MAX + 1), FAT_MAX));
+        assert!(!too_big(Some(FAT_MAX), FAT_MAX));
+        assert!(!too_big(None, FAT_MAX));
+        assert!(!too_big(Some(u64::MAX - 1), u64::MAX));
+        assert!(is_efbig(&std::io::Error::from_raw_os_error(27)));
+        assert!(!is_efbig(&std::io::Error::from_raw_os_error(28)));
+    }
+
+    #[test]
+    fn stick_detection_and_failed_clearing() {
+        assert!(on_stick(5, 2));
+        assert!(!on_stick(2, 2)); // MOUNT is just a dir on /mnt
+        assert!(!dir_ready(Path::new("/nonexistent/sljf/cache")));
+        set_state("fc-fail.ts", FileState::Failed);
+        set_state("fc-grow.ts", FileState::Growing);
+        clear_failed();
+        assert_eq!(registry().lock().unwrap().get("fc-fail.ts"), None);
+        assert_eq!(registry().lock().unwrap().get("fc-grow.ts"), Some(&FileState::Growing));
+        set_state("fc-grow.ts", FileState::Missing);
+        let d = tmp("orphan");
+        std::fs::write(d.join("x.ts.part"), b"1").unwrap();
+        std::fs::write(d.join("y.ts"), b"2").unwrap();
+        on_mount(&d);
+        assert!(!d.join("x.ts.part").exists() && d.join("y.ts").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 
