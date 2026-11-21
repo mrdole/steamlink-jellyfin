@@ -19,6 +19,7 @@ Example with every key: [examples/config.example.json](../examples/config.exampl
 | `device_id` | `steamlink` | Jellyfin DeviceId; give each Link its own |
 | `device_name` | `Steam Link` | Name shown in Jellyfin and Home Assistant |
 | `av_offset_ms` | `0` | Lip-sync for your TV: positive plays the sound later. Find it with the sync clip (DEVELOPING.md); 60 was right for one Vizio |
+| `volume` | `100` | Start volume 0-100 (100 = untouched; the Link always sends full-scale sound over HDMI). Squared, so the steps sound even: 50 = -12 dB, 40 = -16 dB, 20 = -28 dB. A Jellyfin remote or Home Assistant changes it until sljfd restarts |
 | `audio_lang` | `eng` | ISO 639-2 language for picking the audio track when the Jellyfin user has no preference |
 | `player` | `/mnt/scratch/sljf/sljf-play` | Path of the player binary |
 | `ca` | `/mnt/scratch/sljf/ca.pem` | CA bundle used for HTTPS |

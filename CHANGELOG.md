@@ -7,6 +7,12 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Added
+- Volume: the player turns the sound down in software (the Link always sends full-scale audio over HDMI). Start
+  level from `volume` in config (0-100, default 100 = as before); Jellyfin remotes and Home Assistant's volume slider
+  and mute change it while playing (`SetVolume`, `VolumeUp`/`VolumeDown` in steps of 5, `Mute`/`Unmute`/`ToggleMute`),
+  kept until sljfd restarts, and the level is reported back.
+
 ## [0.1.0-alpha.3] - 2026-11-20
 
 ### Added

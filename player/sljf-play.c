@@ -23,6 +23,8 @@
  *                      TV: it arrives at exactly real time, so without a cushion every network hiccup empties the
  *                      audio queue, the sound falls behind and the sync cuts it = stutter). 0 = off (files, default)
  *   env SLJF_SUBS      SRT file: draw these subtitles on an SLVideo overlay (sljf-subs.c); SLJF_SUB_FONT the TTF
+ *   env SLJF_VOLUME    0-100 (default 100 = untouched): software volume, the Link itself always sends full-scale
+ *                      audio over HDMI. stdin "volume N" changes it while playing (heard within the ~1 s queued).
  * Prints one status line per second: queued video ms, queued audio ms, packets, dropped, A/V offset, CPU time.
  * pos= is the time since the requested start: Jellyfin's stream with copied video begins at the keyframe before it
  * (about 3 s early) while the audio begins exactly there, so the first audio timestamp is the zero point.
@@ -72,6 +74,22 @@ void osd_tick(double t);
 
 static volatile int g_stop;
 static void on_signal(int s) { (void)s; g_stop = 1; }
+
+/* Volume: gain in 1/65536 steps on the s16 samples, squared from 0-100 so the steps sound even (50 = -12 dB,
+   40 = -16 dB, 20 = -28 dB, 10 = -40 dB); 100 leaves the samples alone. One multiply + shift per sample. */
+static int32_t g_gain = 65536;
+static void set_volume(int v) {
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    g_gain = (v * v * 65536 + 5000) / 10000;
+    printf("volume %d\n", v);
+}
+static void apply_gain(uint8_t *pcm, int bytes) {
+    int32_t g = g_gain;
+    if (g >= 65536) return;
+    int16_t *p = (int16_t *)pcm;
+    for (int i = 0, n = bytes / 2; i < n; i++) p[i] = (int16_t)((p[i] * g) >> 16);
+}
 
 /* Read-ahead FIFO (SLJF_PREBUFFER_MS, Live TV): packets read but not yet fed to the decoders, with their stream time.
    With a prebuffer a reader thread fills it, so a slow read never holds up feeding: Live TV at the live edge waits in
@@ -152,7 +170,8 @@ static int read_ctl(void) {
         char *nl;
         while ((nl = strchr(buf, '\n'))) {
             *nl = 0;
-            osd_command(buf);
+            if (!strncmp(buf, "volume ", 7)) set_volume(atoi(buf + 7));
+            else osd_command(buf);
             fill -= (int)(nl + 1 - buf);
             memmove(buf, nl + 1, fill + 1);
         }
@@ -184,6 +203,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     setvbuf(stdout, NULL, _IOLBF, 0);                   /* status lines show up over ssh without a tty */
     if (getenv("SLJF_DEBUG")) av_log_set_level(AV_LOG_DEBUG);
+    if (getenv("SLJF_VOLUME") && *getenv("SLJF_VOLUME")) set_volume(atoi(getenv("SLJF_VOLUME")));
 
     AVDictionary *opts = NULL;
     const char *h = getenv("SLJF_HEADERS"), *ua = getenv("SLJF_UA");
@@ -457,7 +477,9 @@ int main(int argc, char **argv) {
                         afill -= k; adrop -= k; memmove(abuf, abuf + k, afill);
                     }
                     while (afill >= AUDIO_CHUNK_BYTES) {
-                        memcpy(SLAudio_BeginFrame(astr), abuf, AUDIO_CHUNK_BYTES);
+                        uint8_t *fr = SLAudio_BeginFrame(astr);
+                        memcpy(fr, abuf, AUDIO_CHUNK_BYTES);
+                        apply_gain(fr, AUDIO_CHUNK_BYTES);
                         SLAudio_SubmitFrame(astr);
                         afill -= AUDIO_CHUNK_BYTES;
                         memmove(abuf, abuf + AUDIO_CHUNK_BYTES, afill);

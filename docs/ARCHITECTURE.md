@@ -29,6 +29,10 @@ old for modern HTTPS. `/mnt/scratch` and `/home` survive reboots; `/etc` is an o
 - **A/V sync**: SLVideo and SLAudio take no timestamps. Once a second the player compares where each output is (pts
   of the last submitted unit minus what is still queued) and inserts silence or drops samples. `av_offset_ms` adds a
   per-TV offset. The frame rate is re-measured from packet timestamps because the probed rate can be wrong.
+- **Volume**: software gain on the decoded 16-bit samples (one multiply and shift each, squared 0-100 curve) before
+  SLAudio, since the Link always outputs full scale. `SLJF_VOLUME` sets it at start, a `volume N` line on stdin
+  changes it live (heard within the ~1 s queued). sljfd keeps the level (config `volume`, then Jellyfin's
+  `SetVolume` / `VolumeUp` / `VolumeDown` / `Mute` / `Unmute` / `ToggleMute`) and reports `VolumeLevel` / `IsMuted`.
 - **Pause** stops the player and restarts it at the same position (starving the decoder is not a pause: its clock keeps
   running). While paused, `sljf-play --card` shows the bar with PAUSED.
 - **Subtitles**: text tracks are fetched as SRT in the background and drawn by sljf-play; picture tracks are burned

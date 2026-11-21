@@ -7,6 +7,7 @@ Home Assistant do. For testing; uses the Link's own Jellyfin login, like sljf-te
   sljf-remote pause | unpause | stop
   sljf-remote seek MIN                  jump to that minute
   sljf-remote key up|down|left|right|select|back|home     drive the on-TV app (home also opens it from the Link menu)
+  sljf-remote volume N | up | down | mute | unmute | togglemute     the player's volume (0-100), like HA's slider
 """
 import importlib.machinery, importlib.util, os, sys
 
@@ -43,6 +44,13 @@ def main():
         name = {"up": "MoveUp", "down": "MoveDown", "left": "MoveLeft", "right": "MoveRight", "select": "Select",
                 "back": "Back", "home": "GoHome"}[a[1]]
         T.api(c, f"/Sessions/{sid}/Command/{name}", "POST")
+    elif a[0] == "volume":
+        name = {"up": "VolumeUp", "down": "VolumeDown", "mute": "Mute", "unmute": "Unmute",
+                "togglemute": "ToggleMute"}.get(a[1])
+        cmd = {"Name": name} if name else {"Name": "SetVolume", "Arguments": {"Volume": str(int(a[1]))}}
+        T.api(c, f"/Sessions/{sid}/Command", "POST", cmd)
+        ps = session(c, link_id).get("PlayState") or {}
+        print(f"volume {ps.get('VolumeLevel')} muted {ps.get('IsMuted')} (shown while something plays)")
     elif a[0] == "seek":
         T.api(c, f"/Sessions/{sid}/Playing/Seek?seekPositionTicks={int(float(a[1]) * 6e8)}", "POST")
     else:

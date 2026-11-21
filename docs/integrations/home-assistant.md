@@ -9,7 +9,7 @@ server relays commands to the Link.
    Jellyfin account the Link uses (`tools/sljf-login`). HA becomes another Jellyfin device: if the account only allows
    listed devices, allow it in the Jellyfin dashboard.
 2. With the Link's daemon running you get, named after `device_name` in config:
-   - `media_player.steam_link`: play/pause, seek, stop, browse media and play it on the TV;
+   - `media_player.steam_link`: play/pause, seek, stop, volume and mute, browse media and play it on the TV;
    - `remote.steam_link`: d-pad and navigation for the on-TV app.
 
 ## Examples
@@ -37,5 +37,12 @@ Typing a search from your phone needs the [LAN API](lan-api.md): see
 ## Notes
 
 - HA starts items at 0:00 (no resume point); seek afterwards, or start from the on-TV app to resume.
-- Volume: the Link has none; control the TV or receiver from HA instead.
+- Volume: the slider and mute set the Link's own software volume (0-100, kept until the daemon restarts; the start
+  level is `volume` in config). HA only shows it while something plays. Turning the TV down as well works too.
+
+```yaml
+action: media_player.volume_set
+target: {entity_id: media_player.steam_link}
+data: {volume_level: 0.4}
+```
 - Power: a smart plug on the Link plus your TV's integration (or HDMI-CEC) can make a "Watch on Steam Link" script.

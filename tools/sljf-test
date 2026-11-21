@@ -39,9 +39,12 @@ def auth_header(c):
             f'Version="{VERSION}", Token="{c["token"]}"')
 
 
-def api(c, path, method="GET"):
-    req = urllib.request.Request(c["server"] + path, method=method,
-                                 headers={"Authorization": auth_header(c), "User-Agent": UA})
+def api(c, path, method="GET", body=None):
+    h = {"Authorization": auth_header(c), "User-Agent": UA}
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(c["server"] + path, method=method, headers=h,
+                                 data=None if body is None else json.dumps(body).encode())
     with urllib.request.urlopen(req, timeout=30) as r:
         body = r.read()
     return json.loads(body) if body else None
