@@ -40,6 +40,8 @@ const INFO_RETRY: Duration = Duration::from_secs(60);
 const REJOIN_MAX: u32 = 3;
 /// A rejoined item that plays this long (s) before it fails again starts a fresh count.
 const REJOIN_CLEAR: f64 = 60.0;
+/// idle fetch-ahead (the next episode of the last channel) runs this long after channel playback ended
+const IDLE_FETCH_S: f64 = 2.0 * 3600.0;
 
 // ---- local time ------------------------------------------------------------------------------------------------
 
@@ -149,6 +151,8 @@ pub struct Chans {
     last_jobs: HashMap<String, Job>,
     /// last channel watched (idle fetch-ahead)
     last: Option<u32>,
+    /// when channel playback last ended (wall clock; None while one plays or before the first tune)
+    last_end: Option<f64>,
     run: u64,
     lines_tx: Sender<(u64, String)>,
     lines_rx: Receiver<(u64, String)>,
@@ -162,7 +166,7 @@ impl Chans {
         Chans {
             lineup: None, loading: None, retry_at: None, day_check: now, zone_logged: false, stick: None, stick_at: now,
             clips: Vec::new(), scan: None, fetcher: None, want_at: now, evict_at: now + EVICT_EVERY, info: InfoMap::default(),
-            asked: Arc::default(), lookup_tx: None, rejoins: None, last_jobs: HashMap::new(), last: None, run: 0, lines_tx, lines_rx, play: None,
+            asked: Arc::default(), lookup_tx: None, rejoins: None, last_jobs: HashMap::new(), last: None, last_end: None, run: 0, lines_tx, lines_rx, play: None,
         }
     }
 
@@ -243,6 +247,12 @@ fn job_ids(es: &[Entry], now: f64, playing: bool, keep: &[String]) -> Vec<String
     ids
 }
 
+/// Idle fetch-ahead runs only for IDLE_FETCH_S after the last channel playback ended (`ended`), then nothing is
+/// fetched until the next tune.
+fn idle_fetch_wanted(ended: Option<f64>, now: f64) -> bool {
+    ended.is_some_and(|t| now - t < IDLE_FETCH_S)
+}
+
 /// Looks items up for chan_resolve (one thread, one item at a time; answers go into `info`).
 fn lookup_thread(api: Api<'static>, uid: String, shared: Arc<local::Shared>, info: InfoMap, asked: Arc<Mutex<HashSet<String>>>, rx: Receiver<String>) {
     for id in rx {
@@ -318,6 +328,12 @@ impl Player {
                     log(&format!("channels: day {}, {} channels ({})", l.snap.day, l.snap.channels.len(),
                         l.snap.channels.iter().map(|c| format!("{} {}", c.number, c.name)).collect::<Vec<_>>().join(", ")));
                     let l = Arc::new(l);
+                    if l.snap.channels.is_empty() {
+                        // inactive from now on (chan_house stops wanting): stop a download still running
+                        if let Some(f) = &self.ch.fetcher {
+                            f.want(Vec::new());
+                        }
+                    }
                     *self.shared.lineup.lock().unwrap() = Some(l.clone());
                     self.ch.lineup = Some(l);
                     self.ch.loading = None;
@@ -456,8 +472,8 @@ impl Player {
         let (number, playing) = match &self.ch.play {
             Some(cp) => (cp.number, true),
             None if self.now.is_none() => match self.ch.last {
-                Some(n) => (n, false),
-                None => return Vec::new(),
+                Some(n) if idle_fetch_wanted(self.ch.last_end, now_f()) => (n, false),
+                _ => return Vec::new(),
             },
             None => return Vec::new(), // a film or episode plays: leave it the bandwidth
         };
@@ -524,6 +540,7 @@ impl Player {
         self.queue.clear();
         self.qi = 0;
         self.ch.last = Some(number);
+        self.ch.last_end = None;
         self.ch.rejoins = None;
         let name = format!("{number} {}", l.snap.channels[i].name);
         self.shared.channel(&channel_id(number));
@@ -598,6 +615,7 @@ impl Player {
             self.end_encode_bg(s);
         }
         if !self.chan_spawn(cp.number, skip_until, delay, exits, fail_key) {
+            self.ch.last_end = Some(now_f());
             self.shared.ended("");
             self.stop(true);
         }
@@ -630,6 +648,7 @@ impl Player {
             self.end_encode_bg(s);
         }
         self.ch.want_at = Instant::now() - WANT_EVERY; // its fetch jobs cancelled on the next tick
+        self.ch.last_end = Some(now_f());
         log(&format!("channel {}: stopped", cp.name));
     }
 
@@ -843,7 +862,17 @@ mod tests {
 
     #[test]
     fn job_names_are_cache_names() {
-        assert!(fetch::valid_name(&job_name("807a5f02c43bb3da713ba94b1f4bf1da")));
+        assert!(fetch::valid_name(&job_name("0123456789abcdef0123456789abcdef")));
+    }
+
+    #[test]
+    fn idle_fetch_stops_two_hours_after_playback() {
+        let t = 1_800_000_000.0;
+        assert!(!idle_fetch_wanted(None, t), "never tuned (or playing): nothing idle");
+        assert!(idle_fetch_wanted(Some(t), t + 60.0));
+        assert!(idle_fetch_wanted(Some(t), t + 2.0 * 3600.0 - 1.0));
+        assert!(!idle_fetch_wanted(Some(t), t + 2.0 * 3600.0));
+        assert!(!idle_fetch_wanted(Some(t), t + 86_400.0));
     }
 
     #[test]
