@@ -7,6 +7,8 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-11-21
+
 ### Added
 - Volume: the player turns the sound down in software (the Link always sends full-scale audio over HDMI). Start
   level from `volume` in config (0-100, default 100 = as before); Jellyfin remotes and Home Assistant's volume slider
@@ -47,7 +49,8 @@ First public release. Early alpha: tested on one Steam Link against one Jellyfin
 - One release version (`VERSION`) used by the daemon, player, tools and Jellyfin device info; `scripts/check.sh`,
   `scripts/bump-version`, `scripts/release.sh`, CI.
 
-[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.3...HEAD
+[Unreleased]: https://github.com/mrdole/steamlink-jellyfin/compare/v0.1.0-alpha.4...HEAD
+[0.1.0-alpha.4]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.4
 [0.1.0-alpha.3]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.3
 [0.1.0-alpha.2]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/mrdole/steamlink-jellyfin/releases/tag/v0.1.0-alpha.1
