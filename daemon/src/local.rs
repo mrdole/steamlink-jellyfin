@@ -471,7 +471,10 @@ fn handle(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, mut conn: TcpStre
     if path == "/cache" {
         // streamed (no Content-Length): the body grows while the fetcher downloads; local port only
         let name = query(q, "f").unwrap_or_default();
-        let _ = conn.set_write_timeout(Some(Duration::from_secs(30)));
+        // the player stops reading for minutes while the next item waits for its cut (its FIFO is
+        // full); a short write timeout would close the socket and end the cached item early. A killed
+        // player closes the socket, so write_all fails anyway.
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(15 * 60)));
         let r = match crate::fetch::cache_dir() {
             Some(dir) => crate::fetch::serve(&dir, &name, &|n| crate::fetch::state_of(n), &mut conn),
             None => Err(404),
