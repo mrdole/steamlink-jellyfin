@@ -16,7 +16,7 @@ ssh "$H" "echo installed: \$(cat $R/VERSION); /etc/init.d/startup/S98sljfd statu
 if [ -d "$HERE/out/app/jellyfin" ]; then   # the on-TV app (build-app.sh): the "Jellyfin" tile on the Link's home screen
   # a running app cannot be overwritten ("text file busy"): close it first, the Link goes back to its menu
   ssh "$H" "killall sljf-ui 2>/dev/null; sleep 1; mkdir -p /home/apps/jellyfin/fonts" 2>/dev/null
-  scp -q -O "$HERE"/out/app/jellyfin/{sljf-ui,main.qml,theme.js,toc.txt,icon.png,run.sh} "$H":/home/apps/jellyfin/ 2>/dev/null
+  scp -q -O "$HERE"/out/app/jellyfin/{sljf-ui,main.qml,Guide.qml,guide.js,theme.js,toc.txt,icon.png,run.sh} "$H":/home/apps/jellyfin/ 2>/dev/null
   scp -q -O "$HERE"/out/app/jellyfin/fonts/* "$H":/home/apps/jellyfin/fonts/ 2>/dev/null
   ssh "$H" "chmod 755 /home/apps/jellyfin/sljf-ui /home/apps/jellyfin/run.sh" 2>/dev/null
 fi

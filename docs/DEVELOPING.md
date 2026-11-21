@@ -4,9 +4,9 @@
 
 | Path | What |
 |---|---|
-| `player/` | `sljf-play.c` (playback), `sljf-subs.c` (subtitle + bar overlay) |
-| `daemon/` | `sljfd` (Rust): `src/main.rs` Jellyfin session + player control, `src/local.rs` local/LAN HTTP |
-| `app/` | On-TV app: `main.cpp` (Qt host, controller input), `main.qml` (UI), `run.sh`, `toc.txt` (tile) |
+| `player/` | `sljf-play.c` (playback), `sljf-subs.c` (subtitle + bar overlay), `sljf-static.c` + `static-gen.c` (Live TV static and hiss) |
+| `daemon/` | `sljfd` (Rust): `src/main.rs` Jellyfin session + player control, `src/local.rs` local/LAN HTTP, `src/guide.rs` TV guide data |
+| `app/` | On-TV app: `main.cpp` (Qt host, controller input), `main.qml` (UI), `Guide.qml` + `guide.js` (TV guide), `run.sh`, `toc.txt` (tile) |
 | `scripts/` | `build.sh`, `build-app.sh`, `deploy.sh`; `check.sh` (pre-merge checks, also CI), `bump-version`, `release.sh` (docs/RELEASING.md) |
 | `tools/` | Test and dev tools (below) |
 | `themes/` | App themes |
@@ -26,6 +26,12 @@ Every script takes `SLJF_HOST` (ssh alias of the Link, default `steamlink`) and 
 
 The test tools use the Link's own login (read over ssh for the run). Only one program may use the decoder: check
 `tools/sljf-remote status` shows nothing playing before running `sljf-test`.
+
+## Host tests
+
+`scripts/check.sh` (also CI) runs, besides the daemon's `cargo test`, two small host tests when their tool exists:
+`node app/test/guide.test.js` (guide layout math) and `player/test/static-gen-test.c` built with `cc` (static noise and
+hiss generators). Missing node or cc prints `skip`.
 
 ## Previewing the app without a TV
 

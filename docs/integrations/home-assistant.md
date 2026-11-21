@@ -23,7 +23,8 @@ data: {media_content_id: "<jellyfin item id>", media_content_type: "movie"}
 ```
 
 D-pad buttons (Jellyfin command names: `MoveUp`, `MoveDown`, `MoveLeft`, `MoveRight`, `Select`, `Back`, `GoHome`;
-`GoHome` also opens the app when the Link shows its own menu):
+`GoHome` goes to the app's home screen, stops a film and returns to the home screen, stops Live TV and opens the TV
+guide on that channel, and opens the app when the Link shows its own menu):
 
 ```yaml
 action: remote.send_command

@@ -11,21 +11,26 @@
 //!   on-screen bar sljf-play draws it from "osd" lines on its stdin (title, progress, hints); see remote_key()
 //!   seek          sljf-play is restarted at the new position (Jellyfin cuts the stream server-side)
 //!   screen        taken from the Link's menu only while something is loaded (/tmp/launch_cmdline.txt + /tmp/sljf.hold)
+//!   Live TV       with live_tv_static: `sljf-play --static` shows static at once while the channel opens on the server
+//!                 in a thread (start_tune); its stream URL then goes to that player as a `url` line (finish_tune).
+//!                 A flip / stop during the wait abandons the open (abandon_tune closes the stream when it returns)
 //!
 //! Usage: sljfd /mnt/scratch/sljf/config.json
 //! config.json: {"server","user_id","token","device_id","device_name","av_offset_ms","player","ca","audio_lang"}  (mode 600)
 //!   audio_lang: ISO 639-2 language used to pick the audio track when the Jellyfin user has no preference (default eng)
 //!   lan_allow, lan_port: optional LAN API (docs/integrations/lan-api.md); off while lan_allow is empty
 //!   open_app_at_boot: open the on-TV app once the Link's menu is up after a boot (default false)
+//!   live_tv_static, static_volume: Live TV static (default true) and its hiss loudness, percent 0-100 (default 8)
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+mod guide;
 mod local;
 
 /// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
@@ -45,6 +50,12 @@ const RETRY_S: [u64; 10] = [2, 4, 8, 15, 30, 30, 30, 60, 60, 60];
 const PLAYER_SILENT: Duration = Duration::from_secs(30);
 /// A player whose position has not moved for this long (not paused) is stuck too, e.g. on the last frame.
 const PLAYER_STUCK: Duration = Duration::from_secs(45);
+/// Live TV flips (static on) while a channel is still opening: the next one is opened this long after the last
+/// Left/Right press, so a quick run of presses opens only the channel it lands on (each open holds one of the server's
+/// tuner slots until it is closed). A single flip opens at once.
+const TUNE_SETTLE: Duration = Duration::from_millis(600);
+/// take_screen_fast: after the app and the Link's menu are gone, this long before the static player opens the screen.
+const SCREEN_GRACE: Duration = Duration::from_millis(100);
 /// Text subtitle tracks for sljf-play, fetched in the background: /tmp/sljf-sub-<item>-<index>.srt (tmpfs)
 fn sub_path(item: &str, index: i64) -> String {
     format!("/tmp/sljf-sub-{item}-{index}.srt")
@@ -93,6 +104,11 @@ struct Cfg {
     lan_port: u16,
     /// open the on-TV app once per boot, in place of the Link's menu (controller prompt)
     open_app_at_boot: bool,
+    /// static on screen (with a faint hiss) while a Live TV channel tunes or drops: the channel opens behind a
+    /// `sljf-play --static` (play_live_static); off = the old blocking open with a black screen
+    live_tv_static: bool,
+    /// loudness of that hiss, percent of full scale (0-100; 0 = silent): SLJF_STATIC for Live TV players
+    static_volume: u8,
     /// start volume 0-100 for sljf-play (100 = untouched); a remote changes it until sljfd restarts
     volume: u8,
 }
@@ -101,6 +117,9 @@ impl Cfg {
     fn load(path: &str) -> Result<Cfg, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        Cfg::parse(&v, path)
+    }
+    fn parse(v: &Value, path: &str) -> Result<Cfg, String> {
         let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
         let c = Cfg {
             server: s("server", "").trim_end_matches('/').to_string(),
@@ -116,6 +135,8 @@ impl Cfg {
                 .unwrap_or_default(),
             lan_port: v["lan_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(local::LAN_PORT),
             open_app_at_boot: v["open_app_at_boot"].as_bool().unwrap_or(false),
+            live_tv_static: v["live_tv_static"].as_bool().unwrap_or(true),
+            static_volume: v["static_volume"].as_u64().map(|n| n.min(100) as u8).unwrap_or(8),
             volume: cfg_volume(&v["volume"]),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
@@ -319,6 +340,27 @@ fn take_screen() {
         "touch {HOLD}; echo 'while [ -e {HOLD} ]; do sleep 1; done' >/tmp/launch_cmdline.txt; killall shell; sleep 2"
     ));
 }
+/// take_screen for Live TV with static: no fixed 2 s wait. The static goes up as soon as the on-TV app (it leaves when
+/// it sees `playing`) and the Link's menu are gone, at most after the same 2 s.
+fn take_screen_fast() {
+    if std::path::Path::new(HOLD).exists() {
+        return;
+    }
+    sh(&format!(
+        "touch {HOLD}; echo 'while [ -e {HOLD} ]; do sleep 1; done' >/tmp/launch_cmdline.txt; killall shell"
+    ));
+    let up = |name: &str| Command::new("pidof").arg(name).stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .map(|s| s.success()).unwrap_or(false);
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(2) && (up("shell") || up("sljf-ui")) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(SCREEN_GRACE);
+}
+/// The stdin line that hands a waiting `sljf-play --static` its stream URL; None if the URL would break the line.
+fn url_line(url: &str) -> Option<String> {
+    if url.contains(['\n', '\r']) { None } else { Some(format!("url {url}\n")) }
+}
 /// Show the on-TV app in place of the Link's menu (same launcher route as take_screen); no-op if it is open.
 fn open_app() {
     sh(&format!("pidof sljf-ui >/dev/null || {{ [ -x {APP} ] && echo {APP} >/tmp/launch_cmdline.txt && killall shell; }}"));
@@ -377,9 +419,53 @@ struct Live {
     live_id: String,
 }
 
+/// A Live TV channel being opened on the server in a thread (start_tune): (stream, video copyable) or the error.
+type Tune = Receiver<Result<(Live, bool), String>>;
+
+/// Open a Live TV channel on the server (a tuner slot: ErsatzTV starts the channel; can take ~15 s).
+fn open_live(api: &Api, id: &str) -> Result<(Live, bool), String> {
+    let body = json!({
+        "UserId": api.cfg.user_id, "AutoOpenLiveStream": true, "EnableDirectPlay": false, "EnableDirectStream": true,
+        "EnableTranscoding": true, "MaxStreamingBitrate": 20_000_000,
+        "DeviceProfile": {"MaxStreamingBitrate": 20_000_000, "DirectPlayProfiles": [],
+            "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac",
+                                     "Protocol": "http", "Context": "Streaming", "MaxAudioChannels": "2"}]},
+    });
+    let r = api.post_json(&format!("/Items/{id}/PlaybackInfo"), &body)?;
+    let ms = &r["MediaSources"][0];
+    let (Some(ms_id), Some(live_id)) = (ms["Id"].as_str(), ms["LiveStreamId"].as_str()) else {
+        return Err(format!("no live stream ({})", r["ErrorCode"].as_str().unwrap_or("no media source")));
+    };
+    Ok((Live { ms_id: ms_id.into(), live_id: live_id.into() }, video_decodable(ms)))
+}
+fn close_live(api: &Api, l: &Live) {
+    if let Err(e) = api.post(&format!("/LiveStreams/Close?liveStreamId={}", l.live_id), &json!({})) {
+        log(&format!("close live stream: {e}"));
+    }
+}
+
+/// End a sljf-play that has no `Now` (the static kept up across a flip): end of stdin, then TERM, then KILL.
+fn end_player(mut c: Child) {
+    drop(c.stdin.take());
+    sh(&format!("kill -TERM {}", c.id()));
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(4) {
+        if let Ok(Some(_)) = c.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+}
+
 struct Now {
     item_id: String,
+    chan: bool,           // a Live TV channel (`live` is None while it is being opened)
     live: Option<Live>,   // Live TV: no position to seek to, restart = open the channel again
+    tune: Option<Tune>,   // static on: the channel is being opened on the server (child = the waiting static player)
+    tune_at: Option<Instant>, // static on, after a flip: open the channel then (TUNE_SETTLE)
+    waiting: bool,        // child is a `sljf-play --static` that has no stream URL yet (no watchdog)
     name: String,
     title: String,        // for the on-screen bar: "Series · S3E5 Episode", "Film (1984)", "11 Channel · Program"
     runtime: i64,
@@ -399,9 +485,11 @@ struct Now {
     last_report: Instant,
 }
 
-struct Player<'a> {
-    cfg: &'a Cfg,
-    api: Api<'a>,
+struct Player {
+    cfg: &'static Cfg,
+    api: Api<'static>, // 'static: Live TV opens run in threads (start_tune, abandon_tune)
+    standby: Option<(Child, Receiver<String>)>, // static player kept up across a Live TV flip, for play_live_static
+    settle: bool, // that flip came while a channel was still opening (a run of presses): open after TUNE_SETTLE
     queue: Vec<String>,
     qi: usize,
     now: Option<Now>,
@@ -463,7 +551,7 @@ fn short_episode(item: &Value) -> String {
     .replace(['\t', '\n', '\r'], " ")
 }
 
-impl<'a> Player<'a> {
+impl Player {
     fn stream_url(&self, item: &str, copy: bool, tr: &Tracks, session: &str, ticks: i64, live: Option<&Live>) -> String {
         if let Some(l) = live {
             // ErsatzTV channels are H.264 + AAC stereo in MPEG-TS already: copy both when the video fits the decoder
@@ -496,25 +584,29 @@ impl<'a> Player<'a> {
         u
     }
 
-    fn spawn(&self, item: &str, copy: bool, tr: &Tracks, ticks: i64, live: Option<&Live>) -> Result<(Child, Receiver<String>, String), String> {
-        let session = session_id();
-        let url = self.stream_url(item, copy, tr, &session, ticks, live);
-        let mut child = Command::new(&self.cfg.player)
-            .arg(&url)
-            .env("SLJF_START", format!("{:.3}", ticks as f64 / TICKS))
+    /// sljf-play with the environment every run gets (stream URL or `--static` still to be added).
+    fn player_cmd(&self, tr: &Tracks, ticks: i64, live: bool) -> Command {
+        let mut c = Command::new(&self.cfg.player);
+        c.env("SLJF_START", format!("{:.3}", ticks as f64 / TICKS))
             // live TV comes at exactly real time: a 3 s cushion against network hiccups (files arrive faster)
-            .env("SLJF_PREBUFFER_MS", if live.is_some() { "3000" } else { "0" })
+            .env("SLJF_PREBUFFER_MS", if live { "3000" } else { "0" })
             .env("SLJF_SUBS", tr.sub_path.as_deref().unwrap_or(""))
             .env("SLJF_HEADERS", format!("Authorization: {}\r\n", self.cfg.auth()))
             .env("SLJF_CA", &self.cfg.ca)
             .env("SLJF_UA", UA)
             .env("SLJF_AV_OFFSET_MS", self.cfg.av_offset_ms.to_string())
             .env("SLJF_VOLUME", self.heard_volume().to_string())
-            .stdin(Stdio::piped()) // "osd" lines: the on-screen bar
+            .stdin(Stdio::piped()) // "osd" lines: the on-screen bar, "volume N"; `url` for a waiting --static
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("{}: {e}", self.cfg.player))?;
+            .stderr(Stdio::null());
+        if live && self.cfg.live_tv_static {
+            c.env("SLJF_STATIC", self.cfg.static_volume.to_string()); // static while tuning and on rebuffer
+        }
+        c
+    }
+
+    fn start_player(&self, mut cmd: Command) -> Result<(Child, Receiver<String>), String> {
+        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", self.cfg.player))?;
         let out = child.stdout.take().ok_or("no stdout")?;
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -524,7 +616,29 @@ impl<'a> Player<'a> {
                 }
             }
         });
+        Ok((child, rx))
+    }
+
+    fn spawn(&self, item: &str, copy: bool, tr: &Tracks, ticks: i64, live: Option<&Live>) -> Result<(Child, Receiver<String>, String), String> {
+        let session = session_id();
+        let url = self.stream_url(item, copy, tr, &session, ticks, live);
+        let mut cmd = self.player_cmd(tr, ticks, live.is_some());
+        cmd.arg(&url);
+        let (child, rx) = self.start_player(cmd)?;
         Ok((child, rx, session))
+    }
+
+    /// Live TV with static: `sljf-play --static`, static on screen until a `url` line arrives on its stdin.
+    fn spawn_waiting(&self) -> Result<(Child, Receiver<String>), String> {
+        let mut cmd = self.player_cmd(&Tracks::default(), 0, true);
+        cmd.arg("--static");
+        self.start_player(cmd)
+    }
+
+    fn kill_standby(&mut self) {
+        if let Some((c, _)) = self.standby.take() {
+            end_player(c);
+        }
     }
 
     fn body(&self, n: &Now, event: Option<&str>) -> Value {
@@ -532,7 +646,7 @@ impl<'a> Player<'a> {
             "ItemId": n.item_id, "PlaySessionId": n.session,
             "MediaSourceId": n.live.as_ref().map(|l| l.ms_id.clone()).unwrap_or_else(|| n.item_id.clone()),
             "LiveStreamId": n.live.as_ref().map(|l| l.live_id.clone()),
-            "PositionTicks": n.pos_ticks, "IsPaused": n.paused, "IsMuted": self.muted, "VolumeLevel": self.volume, "CanSeek": n.live.is_none(),
+            "PositionTicks": n.pos_ticks, "IsPaused": n.paused, "IsMuted": self.muted, "VolumeLevel": self.volume, "CanSeek": !n.chan,
             "PlayMethod": if n.copy { "DirectStream" } else { "Transcode" }, "RepeatMode": "RepeatNone",
             "NowPlayingQueue": self.queue.iter().enumerate()
                 .map(|(i, id)| json!({"Id": id, "PlaylistItemId": format!("q{i}")})).collect::<Vec<_>>(),
@@ -550,6 +664,9 @@ impl<'a> Player<'a> {
 
     fn report(&mut self, what: &str, event: Option<&str>) {
         if let Some(n) = &self.now {
+            if n.session.is_empty() {
+                return; // a Live TV channel still opening for the first time: nothing started on the server yet
+            }
             let path = match what {
                 "start" => "/Sessions/Playing",
                 "stop" => "/Sessions/Playing/Stopped",
@@ -580,7 +697,19 @@ impl<'a> Player<'a> {
             }
             let _ = child.kill();
             let _ = child.wait();
-            self.api.delete(&format!("/Videos/ActiveEncodings?DeviceId={}&PlaySessionId={}", self.cfg.device_id, n.session));
+        }
+        self.end_encode();
+    }
+
+    /// Tell the server to end the encode of the current play session (after its player is gone).
+    fn end_encode(&self) {
+        if let Some(n) = self.now.as_ref() {
+            self.end_encode_of(&n.session);
+        }
+    }
+    fn end_encode_of(&self, session: &str) {
+        if !session.is_empty() {
+            self.api.delete(&format!("/Videos/ActiveEncodings?DeviceId={}&PlaySessionId={session}", self.cfg.device_id));
         }
     }
 
@@ -599,6 +728,7 @@ impl<'a> Player<'a> {
         if item["Type"] == "TvChannel" {
             return self.play_live(&id, &item);
         }
+        self.kill_standby(); // a static kept up by a flip, and the queue's next item is not a channel
         let decodable = video_decodable(&item);
         let audio = pick_audio(&item, self.asked_audio.take(), &self.lang);
         let sub = pick_sub(&item, self.asked_sub.take(), &self.sub_pref);
@@ -619,7 +749,7 @@ impl<'a> Player<'a> {
                     if copy { "copied" } else { "re-encoded by the server" }, audio.map(|a| a.to_string()).unwrap_or("-".into()),
                     match (tr.sub, tr.burn) { (None, _) => "off".to_string(), (Some(s), true) => format!("#{s} burned in"), (Some(s), false) => format!("#{s} drawn") }));
                 self.now = Some(Now {
-                    item_id: id, live: None, name, title: bar_title(&item), runtime: item["RunTimeTicks"].as_i64().unwrap_or(0), copy, tr, session,
+                    item_id: id, chan: false, live: None, tune: None, tune_at: None, waiting: false, name, title: bar_title(&item), runtime: item["RunTimeTicks"].as_i64().unwrap_or(0), copy, tr, session,
                     start_ticks: ticks, pos_ticks: ticks, paused: false, eof: false, restarts: 0,
                     retry_at: None, last_line: Instant::now(), pos_moved: Instant::now(), child: Some(child), lines: Some(lines), last_report: Instant::now(),
                 });
@@ -633,31 +763,20 @@ impl<'a> Player<'a> {
         }
     }
 
-    /// Open a Live TV channel on the server (a tuner slot: ErsatzTV starts the channel) and play it.
     fn open_live(&self, id: &str) -> Result<(Live, bool), String> {
-        let body = json!({
-            "UserId": self.cfg.user_id, "AutoOpenLiveStream": true, "EnableDirectPlay": false, "EnableDirectStream": true,
-            "EnableTranscoding": true, "MaxStreamingBitrate": 20_000_000,
-            "DeviceProfile": {"MaxStreamingBitrate": 20_000_000, "DirectPlayProfiles": [],
-                "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac",
-                                         "Protocol": "http", "Context": "Streaming", "MaxAudioChannels": "2"}]},
-        });
-        let r = self.api.post_json(&format!("/Items/{id}/PlaybackInfo"), &body)?;
-        let ms = &r["MediaSources"][0];
-        let (Some(ms_id), Some(live_id)) = (ms["Id"].as_str(), ms["LiveStreamId"].as_str()) else {
-            return Err(format!("no live stream ({})", r["ErrorCode"].as_str().unwrap_or("no media source")));
-        };
-        Ok((Live { ms_id: ms_id.into(), live_id: live_id.into() }, video_decodable(ms)))
+        open_live(&self.api, id)
     }
     fn close_live(&self, l: &Live) {
-        if let Err(e) = self.api.post(&format!("/LiveStreams/Close?liveStreamId={}", l.live_id), &json!({})) {
-            log(&format!("close live stream: {e}"));
-        }
+        close_live(&self.api, l)
     }
 
+    /// Play a Live TV channel. Static on: play_live_static; off: open it first (black screen meanwhile), then play.
     fn play_live(&mut self, id: &str, item: &Value) {
         let name = format!("{} {}", item["ChannelNumber"].as_str().or(item["Number"].as_str()).unwrap_or(""), item["Name"].as_str().unwrap_or("?"))
             .trim().to_string();
+        if self.cfg.live_tv_static {
+            return self.play_live_static(id, item, name);
+        }
         // opening can take ~15 s (ErsatzTV starts the channel): the app keeps showing STARTING meanwhile
         let (live, copy) = match self.open_live(id) {
             Ok(v) => v,
@@ -666,6 +785,7 @@ impl<'a> Player<'a> {
                 return self.stop(true);
             }
         };
+        self.shared.channel(id);
         self.shared.playing(true, false, &name);
         take_screen();
         let tr = Tracks::default();
@@ -673,7 +793,8 @@ impl<'a> Player<'a> {
             Ok((child, lines, session)) => {
                 log(&format!("play: live {name} [{id}], video {}", if copy { "copied" } else { "re-encoded by the server" }));
                 self.now = Some(Now {
-                    item_id: id.into(), live: Some(live), name, title: bar_title(item), runtime: 0, copy, tr, session, start_ticks: 0, pos_ticks: 0,
+                    item_id: id.into(), chan: true, live: Some(live), tune: None, tune_at: None, waiting: false,
+                    name, title: bar_title(item), runtime: 0, copy, tr, session, start_ticks: 0, pos_ticks: 0,
                     paused: false, eof: false, restarts: 0, retry_at: None, last_line: Instant::now(), pos_moved: Instant::now(),
                     child: Some(child), lines: Some(lines), last_report: Instant::now(),
                 });
@@ -686,6 +807,167 @@ impl<'a> Player<'a> {
                 self.stop(true);
             }
         }
+    }
+
+    /// Live TV with static: the app gives up the screen at once (it leaves when it sees `playing`), static goes up,
+    /// and the channel opens in the background; commands keep working meanwhile (tick -> finish_tune).
+    fn play_live_static(&mut self, id: &str, item: &Value, name: String) {
+        self.shared.channel(id);
+        self.shared.playing(true, false, &name);
+        let settle = self.standby.is_some() && std::mem::take(&mut self.settle);
+        let (child, lines) = match self.standby.take() {
+            Some((c, l)) => (Some(c), Some(l)), // a flip: the static is up already
+            None => {
+                take_screen_fast();
+                match self.spawn_waiting() {
+                    Ok((c, l)) => (Some(c), Some(l)),
+                    Err(e) => {
+                        log(&format!("static: {e}")); // tune anyway; finish_tune starts a normal player
+                        (None, None)
+                    }
+                }
+            }
+        };
+        log(&format!("live {name} [{id}]: tuning behind the static"));
+        let now = Instant::now();
+        self.now = Some(Now {
+            item_id: id.into(), chan: true, live: None, tune: None, tune_at: settle.then(|| now + TUNE_SETTLE), waiting: true,
+            name, title: bar_title(item), runtime: 0, copy: false, tr: Tracks::default(), session: String::new(),
+            start_ticks: 0, pos_ticks: 0, paused: false, eof: false, restarts: 0, retry_at: None, last_line: now, pos_moved: now,
+            child, lines, last_report: now,
+        });
+        if !settle {
+            self.start_tune(id);
+        }
+    }
+
+    /// Open channel `id` on the server in a thread; tick() hands the result to finish_tune.
+    fn start_tune(&mut self, id: &str) {
+        if let Some(old) = self.now.as_mut().and_then(|n| n.tune.take()) {
+            self.abandon_tune(old); // (not expected: callers start one open at a time)
+        }
+        let (tx, rx) = channel();
+        let (api, id) = (self.api.clone(), id.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(open_live(&api, &id));
+        });
+        if let Some(n) = self.now.as_mut() {
+            n.tune = Some(rx);
+            n.tune_at = None;
+        }
+    }
+
+    /// The channel opened (or failed): hand its URL to the waiting static player, or retry / stop as without static.
+    fn finish_tune(&mut self, r: Result<(Live, bool), String>) {
+        let Some(n) = self.now.as_mut() else { return };
+        n.tune = None;
+        let (live, copy) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                let why = format!("live {}: {e}", n.name);
+                if n.session.is_empty() {
+                    log(&why); // never played: stop, as a failed open without static does
+                    return self.stop(true);
+                }
+                let k = n.restarts + 1; // reopening after a drop: retry with the static kept up
+                return self.retry_later(k, &why);
+            }
+        };
+        let first = n.session.is_empty();
+        let (id, tr, name) = (n.item_id.clone(), n.tr.clone(), n.name.clone());
+        let session = session_id();
+        let url = self.stream_url(&id, copy, &tr, &session, 0, Some(&live));
+        let n = self.now.as_mut().unwrap();
+        let sent = n.waiting && url_line(&url).zip(n.child.as_mut().and_then(|c| c.stdin.as_mut()))
+            .map(|(line, w)| w.write_all(line.as_bytes()).and_then(|_| w.flush()).is_ok()).unwrap_or(false);
+        if sent {
+            n.session = session;
+        } else {
+            // no waiting player (it died, or could not start): a normal one, which shows static itself while it opens
+            self.kill_child();
+            match self.spawn(&id, copy, &tr, 0, Some(&live)) {
+                Ok((child, lines, session)) => {
+                    let n = self.now.as_mut().unwrap();
+                    n.child = Some(child);
+                    n.lines = Some(lines);
+                    n.session = session;
+                }
+                Err(e) => {
+                    self.close_live(&live);
+                    let why = format!("play: {e}");
+                    if first {
+                        log(&why);
+                        return self.stop(true);
+                    }
+                    let k = self.now.as_ref().map(|n| n.restarts).unwrap_or(0) + 1;
+                    return self.retry_later(k, &why);
+                }
+            }
+        }
+        let n = self.now.as_mut().unwrap();
+        n.live = Some(live);
+        n.copy = copy;
+        n.waiting = false;
+        n.eof = false;
+        n.start_ticks = 0;
+        n.pos_ticks = 0;
+        n.retry_at = None;
+        n.last_line = Instant::now();
+        n.pos_moved = Instant::now();
+        log(&format!("play: live {name} [{id}], video {}", if copy { "copied" } else { "re-encoded by the server" }));
+        if first { self.report("start", None) } else { self.report("progress", Some("timeupdate")) }
+        self.osd(5, None);
+    }
+
+    /// A channel open nobody waits for any more (flip, stop): close its stream when it returns (frees the tuner slot).
+    fn abandon_tune(&self, rx: Tune) {
+        let api = self.api.clone();
+        std::thread::spawn(move || {
+            if let Ok(Ok((l, _))) = rx.recv() {
+                log(&format!("close live stream {} (its tune was abandoned)", l.live_id));
+                close_live(&api, &l);
+            }
+        });
+    }
+
+    /// Live TV with static: open the channel again behind the static (stream died, retry after a failure, resume).
+    fn retune(&mut self, counted: bool) {
+        let keep = self.now.as_ref().map(|n| n.waiting && n.child.is_some()).unwrap_or(false);
+        if keep {
+            self.kill_card();
+        } else {
+            self.kill_child();
+        }
+        let spawned = (!keep).then(|| self.spawn_waiting());
+        let Some(n) = self.now.as_mut() else { return };
+        match spawned {
+            Some(Ok((c, l))) => {
+                n.child = Some(c);
+                n.lines = Some(l);
+            }
+            Some(Err(e)) => log(&format!("static: {e}")),
+            None => {}
+        }
+        n.waiting = true;
+        if !counted {
+            n.restarts = 0;
+        }
+        n.paused = false;
+        n.eof = false;
+        n.retry_at = None;
+        n.start_ticks = 0;
+        n.pos_ticks = 0;
+        n.last_line = Instant::now();
+        n.pos_moved = Instant::now();
+        let (old_tune, old_live, id, name) = (n.tune.take(), n.live.take(), n.item_id.clone(), n.name.clone());
+        if let Some(rx) = old_tune {
+            self.abandon_tune(rx);
+        }
+        if let Some(l) = old_live {
+            self.close_live(&l); // the static is up already: this call can take a moment
+        }
+        log(&format!("live {name} [{id}]: tuning again behind the static"));
+        self.start_tune(&id);
     }
 
     /// How subtitle track `sub` gets on screen: text tracks are drawn by sljf-play from an SRT that is fetched in the
@@ -783,20 +1065,26 @@ impl<'a> Player<'a> {
 
     /// Restart sljf-play for the same item at another position (seek, resume, or the stream died: `counted`).
     fn restart_at(&mut self, ticks: i64, counted: bool) {
+        if self.cfg.live_tv_static && self.now.as_ref().map(|n| n.chan).unwrap_or(false) {
+            return self.retune(counted);
+        }
         self.kill_child();
         let Some(mut n) = self.now.take() else { return };
         let ticks = ticks.clamp(0, if n.runtime > 0 { (n.runtime - 5 * TICKS as i64).max(0) } else { i64::MAX });
         let restarts = if counted { n.restarts } else { 0 }; // failures so far (retry_later counted this one)
         let mut failed = None;
-        if let Some(old) = n.live.take() {
+        if n.chan {
             // live: the old stream may be gone (that may be why we are here); open the channel again, at "now"
-            self.close_live(&old);
+            // (also after a failed reopen, when there is no old stream left)
+            if let Some(old) = n.live.take() {
+                self.close_live(&old);
+            }
             match self.open_live(&n.item_id) {
                 Ok((l, _)) => n.live = Some(l),
                 Err(e) => failed = Some(format!("live {}: {e}", n.name)),
             }
         }
-        let ticks = if n.live.is_some() || failed.is_some() && n.runtime == 0 { 0 } else { ticks };
+        let ticks = if n.chan { 0 } else { ticks };
         if failed.is_none() {
             match self.spawn(&n.item_id, n.copy, &n.tr, ticks, n.live.as_ref()) {
                 Ok((child, lines, session)) => {
@@ -816,15 +1104,34 @@ impl<'a> Player<'a> {
     }
 
     /// After failure number `k` in a row: try again after a growing wait, or give up when the waits are used up.
+    /// Live TV with static: a static player stays up during the wait (the one that waited for this open, or a new one).
     fn retry_later(&mut self, k: u32, why: &str) {
+        let with_static = self.cfg.live_tv_static && self.now.as_ref().map(|n| n.chan).unwrap_or(false);
         let Some(n) = self.now.as_mut() else { return };
         match RETRY_S.get(k.saturating_sub(1) as usize) {
             Some(&s) => {
                 log(&format!("{why}: retrying at {:.0} s in {s} s ({k}/{})", n.pos_ticks as f64 / TICKS, RETRY_S.len()));
                 n.restarts = k;
-                n.child = None;
-                n.lines = None;
                 n.retry_at = Some(Instant::now() + Duration::from_secs(s));
+                if !with_static {
+                    n.child = None;
+                    n.lines = None;
+                    return;
+                }
+                if n.waiting && n.child.is_some() {
+                    return; // the static that waited for the failed open stays
+                }
+                self.kill_child(); // (callers have stopped the player already: this reaps / clears it)
+                let spawned = self.spawn_waiting();
+                let Some(n) = self.now.as_mut() else { return };
+                n.waiting = true;
+                match spawned {
+                    Ok((c, l)) => {
+                        n.child = Some(c);
+                        n.lines = Some(l);
+                    }
+                    Err(e) => log(&format!("static: {e}")),
+                }
             }
             None => {
                 log(&format!("{why}: giving up"));
@@ -834,9 +1141,14 @@ impl<'a> Player<'a> {
     }
 
     fn stop(&mut self, clear_queue: bool) {
+        self.kill_standby();
         if self.now.is_some() {
             self.kill_child();
             self.report("stop", None);
+            if let Some((rx, name)) = self.now.as_mut().and_then(|n| n.tune.take().map(|t| (t, n.name.clone()))) {
+                log(&format!("live {name}: tune abandoned"));
+                self.abandon_tune(rx);
+            }
             if let Some(l) = self.now.as_ref().and_then(|n| n.live.clone()) {
                 self.close_live(&l);
             }
@@ -858,7 +1170,10 @@ impl<'a> Player<'a> {
     }
 
     fn pause(&mut self, want: Option<bool>) {
-        let Some((paused, pos)) = self.now.as_ref().map(|n| (n.paused, n.pos_ticks)) else { return };
+        let Some((paused, pos, waiting)) = self.now.as_ref().map(|n| (n.paused, n.pos_ticks, n.waiting)) else { return };
+        if waiting {
+            return log("live TV: tuning, nothing to pause");
+        }
         let p = want.unwrap_or(!paused);
         if p == paused {
             return;
@@ -885,7 +1200,7 @@ impl<'a> Player<'a> {
     /// Seconds left of an episode that another one follows, in its last COUNTDOWN_S (else None).
     fn countdown(&self) -> Option<i64> {
         let n = self.now.as_ref()?;
-        if n.live.is_some() || n.paused || n.runtime <= 0 || self.qi + 1 >= self.queue.len() || n.child.is_none() {
+        if n.chan || n.paused || n.runtime <= 0 || self.qi + 1 >= self.queue.len() || n.child.is_none() {
             return None;
         }
         let left = (n.runtime - n.pos_ticks) / TICKS as i64;
@@ -921,7 +1236,7 @@ impl<'a> Player<'a> {
     fn osd(&mut self, secs: i32, pos: Option<i64>) {
         let hint = self.hint();
         let Some(n) = self.now.as_mut() else { return };
-        let dur = if n.live.is_some() { 0.0 } else { n.runtime as f64 / TICKS };
+        let dur = if n.chan { 0.0 } else { n.runtime as f64 / TICKS };
         let p = pos.map(|p| format!("{:.0}", p as f64 / TICKS)).unwrap_or_else(|| "-1".into());
         let line = format!("osd {secs}\t{}\t{dur:.0}\t{hint}\t{p}\n", n.title);
         let pipe = match n.child.as_mut() {
@@ -989,7 +1304,7 @@ impl<'a> Player<'a> {
         log(&format!("remote {k} during playback"));
         self.auto_eps = 0;
         let (live, paused, pos, runtime) = match self.now.as_ref() {
-            Some(n) => (n.live.is_some(), n.paused, n.pos_ticks, n.runtime),
+            Some(n) => (n.chan, n.paused, n.pos_ticks, n.runtime),
             None => return,
         };
         let bar = |p: &mut Self, at: Option<i64>| if paused { p.show_card() } else { p.osd(5, at) };
@@ -1005,7 +1320,15 @@ impl<'a> Player<'a> {
         }
         match k {
             "Select" => self.pause(None),
-            "Back" | "GoHome" => self.stop(true),
+            "Back" => {
+                self.shared.ended("");
+                self.stop(true)
+            }
+            "GoHome" => {
+                // the app reads this when it comes back: Live TV returns to the guide, a film or episode to home
+                self.shared.ended(if live { "guide" } else { "home" });
+                self.stop(true)
+            }
             "MoveUp" => bar(self, None),
             "MoveDown" => {
                 let left = self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs() / 60);
@@ -1033,11 +1356,43 @@ impl<'a> Player<'a> {
 
     fn next(&mut self, step: i64) {
         let mut qi = self.qi as i64 + step;
-        if self.now.as_ref().map(|n| n.live.is_some()).unwrap_or(false) && !self.queue.is_empty() {
+        let chan = self.now.as_ref().map(|n| n.chan).unwrap_or(false);
+        if chan && !self.queue.is_empty() {
             qi = qi.rem_euclid(self.queue.len() as i64); // channel up/down goes round
         }
         if qi < 0 || qi >= self.queue.len() as i64 {
             return self.stop(true);
+        }
+        if chan && self.cfg.live_tv_static {
+            // channel flip: static first (the waiting one of a tune still in progress, else a new one in place of the
+            // picture), then the slow part: stopping the old channel, opening the new one (play_live_static)
+            let busy = self.now.as_ref().map(|n| n.tune.is_some() || n.tune_at.is_some()).unwrap_or(false);
+            let waiting = self.now.as_mut().filter(|n| n.waiting && n.child.is_some() && n.lines.is_some())
+                .map(|n| (n.child.take().unwrap(), n.lines.take().unwrap()));
+            let standby = match waiting {
+                Some(w) => Some(w),
+                None => {
+                    // as kill_child, but the server call that ends the old encode waits until the static is up
+                    self.kill_card();
+                    let old = self.now.as_mut().and_then(|n| { n.lines = None; n.child.take() });
+                    let had = old.is_some();
+                    if let Some(c) = old {
+                        end_player(c);
+                    }
+                    let s = self.spawn_waiting().map_err(|e| log(&format!("static: {e}"))).ok();
+                    if had {
+                        self.end_encode();
+                    }
+                    s
+                }
+            };
+            self.stop(false); // also abandons a tune in progress
+            self.standby = standby;
+            self.settle = busy;
+            self.qi = qi as usize;
+            self.play_current(0);
+            self.settle = false;
+            return self.kill_standby(); // not used: the item did not load, or is not a channel
         }
         self.stop(false);
         self.qi = qi as usize;
@@ -1081,7 +1436,7 @@ impl<'a> Player<'a> {
                     "Pause" => self.pause(Some(true)),
                     "Unpause" => self.pause(Some(false)),
                     "PlayPause" => self.pause(None),
-                    "Seek" | "Rewind" | "FastForward" if self.now.as_ref().map(|n| n.live.is_some()).unwrap_or(false) => {
+                    "Seek" | "Rewind" | "FastForward" if self.now.as_ref().map(|n| n.chan).unwrap_or(false) => {
                         log("live TV: no seeking")
                     }
                     "Seek" => {
@@ -1192,6 +1547,18 @@ impl<'a> Player<'a> {
                 }
             }
         }
+        // Live TV with static: the channel opened (or failed) on the server, or a flip has settled
+        let tuned = self.now.as_ref().and_then(|n| n.tune.as_ref()).and_then(|rx| match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("open thread ended".into())),
+        });
+        if let Some(r) = tuned {
+            self.finish_tune(r);
+        }
+        if let Some(id) = self.now.as_ref().filter(|n| n.tune_at.is_some_and(|t| Instant::now() >= t)).map(|n| n.item_id.clone()) {
+            self.start_tune(&id);
+        }
         match &self.now {
             Some(n) => self.shared.playing(true, n.paused, &n.name),
             None => self.shared.playing(false, false, ""),
@@ -1217,17 +1584,24 @@ impl<'a> Player<'a> {
                     }
                 } else if line.starts_with("end of stream") {
                     n.eof = true;
-                } else if ["opened", "video h264", "frame rate", "played out", "sync:", "subs:", "prebuffered", "read-ahead", "stream error", "open failed", "no ", "video is", "SL", "audio decoder"].iter().any(|p| line.starts_with(p)) {
+                } else if ["opened", "video h264", "frame rate", "played out", "sync:", "subs:", "prebuffered", "read-ahead", "stream error", "open failed", "no ", "video is", "SL", "audio decoder", "static"].iter().any(|p| line.starts_with(p)) {
                     log(&format!("player: {line}"));
                 }
             }
             if let Some(Ok(Some(st))) = n.child.as_mut().map(|c| c.try_wait()) {
                 exited = Some((st.code().unwrap_or(-1), n.eof, n.pos_ticks, n.restarts, n.runtime));
-            } else if n.child.is_some() && n.last_line.elapsed() > PLAYER_SILENT {
+            } else if n.child.is_some() && !n.waiting && n.last_line.elapsed() > PLAYER_SILENT {
                 exited = Some((-2, false, n.pos_ticks, n.restarts, n.runtime)); // hung: kill_child below
-            } else if n.child.is_some() && n.pos_moved.elapsed() > PLAYER_STUCK {
+            } else if n.child.is_some() && !n.waiting && n.pos_moved.elapsed() > PLAYER_STUCK {
                 exited = Some((-3, false, n.pos_ticks, n.restarts, n.runtime)); // picture frozen: as hung
             }
+        }
+        if let Some((code, ..)) = exited.filter(|_| self.now.as_ref().map(|n| n.waiting).unwrap_or(false)) {
+            // the static player died while the channel opens / a retry waits: reap it; the open or retry goes on
+            // (finish_tune then starts a normal player, retune a new static one)
+            log(&format!("static player exited (code {code}) while waiting for the channel"));
+            self.kill_child();
+            exited = None;
         }
         let due = self.now.as_ref().and_then(|n| n.retry_at).map(|t| Instant::now() >= t).unwrap_or(false);
         if due {
@@ -1238,7 +1612,7 @@ impl<'a> Player<'a> {
             return self.restart_at(pos, true);
         }
         if let Some((code, eof, pos, restarts, runtime)) = exited {
-            let live = self.now.as_ref().map(|n| n.live.is_some()).unwrap_or(false);
+            let live = self.now.as_ref().map(|n| n.chan).unwrap_or(false);
             let near_end = runtime > 0 && pos > runtime - 30 * TICKS as i64;
             if !live && ((eof && code == 0) || near_end) {
                 let more = self.qi + 1 < self.queue.len();
@@ -1256,9 +1630,22 @@ impl<'a> Player<'a> {
                     self.next(1);
                 }
             } else {
-                self.kill_child(); // reaps it (or kills a hung one) and ends the server's encode
                 let why = if code == -2 { "player silent for 30 s".to_string() } else if code == -3 { "position stuck for 45 s".to_string() } else { format!("player exited (code {code})") };
-                self.retry_later(restarts + 1, &why);
+                if live && self.cfg.live_tv_static {
+                    // reap it (or kill a hung one), static up (retry_later), and only then the server call that ends
+                    // the encode: it can block up to the Api timeout when the server is unreachable
+                    self.kill_card();
+                    let old = self.now.as_mut().and_then(|n| { n.lines = None; n.child.take() });
+                    let session = self.now.as_ref().map(|n| n.session.clone()).unwrap_or_default();
+                    if let Some(c) = old {
+                        end_player(c);
+                    }
+                    self.retry_later(restarts + 1, &why);
+                    self.end_encode_of(&session);
+                } else {
+                    self.kill_child(); // reaps it (or kills a hung one) and ends the server's encode
+                    self.retry_later(restarts + 1, &why);
+                }
             }
             return;
         }
@@ -1425,7 +1812,7 @@ fn main() {
     }
     shared.set_lang(&cfg.audio_lang);
     let mut p = Player {
-        cfg, api: Api::new(cfg), queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
+        cfg, api: Api::new(cfg), standby: None, settle: false, queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
         asked_audio: None, lang: cfg.audio_lang.clone(), asked_sub: None, sub_pref: SubPref::Default, cmds, sub_tx, sub_rx, shared,
         card: None, seek_to: None, sleep_at: None, auto_eps: 0, no_next: false, next_label: None,
         volume: cfg.volume, muted: false,
@@ -1449,6 +1836,38 @@ fn main() {
         // ("not valid yet"): keep trying every 2 s then, so the Link is back as soon as the time is right
         let clock_set = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() > 1_700_000_000).unwrap_or(false);
         wait = if clock_set { (wait * 2).min(60) } else { 2 };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Cfg {
+        let v: Value = serde_json::from_str(&format!("{{\"server\":\"https://x\",\"user_id\":\"u\",\"token\":\"t\"{extra}}}")).unwrap();
+        Cfg::parse(&v, "test").unwrap()
+    }
+
+    #[test]
+    fn cfg_static_defaults() {
+        let c = parse("");
+        assert!(c.live_tv_static);
+        assert_eq!(c.static_volume, 8);
+    }
+
+    #[test]
+    fn cfg_static_set_and_clamped() {
+        let c = parse(",\"live_tv_static\":false,\"static_volume\":250");
+        assert!(!c.live_tv_static);
+        assert_eq!(c.static_volume, 100);
+        assert_eq!(parse(",\"static_volume\":0").static_volume, 0);
+    }
+
+    #[test]
+    fn live_url_line() {
+        assert_eq!(url_line("https://x/Videos/1/stream.ts?a=1&b=2").as_deref(), Some("url https://x/Videos/1/stream.ts?a=1&b=2\n"));
+        assert_eq!(url_line("https://x/a\nosd 5"), None);
+        assert_eq!(url_line("https://x/a\r"), None);
     }
 }
 

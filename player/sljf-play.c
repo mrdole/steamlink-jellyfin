@@ -9,8 +9,12 @@
  *
  * Usage:  sljf-play <url> [seconds]        (0 or no seconds = until the end)
  *         sljf-play --card                  no video: only the on-screen bar (sljfd shows it while paused)
- *   stdin: control lines from sljfd, "osd ..." = the on-screen bar (sljf-subs.c, osd_command). End of stdin is
- *   ignored when playing (sljf-test gives none) and ends --card.
+ *         sljf-play --static [seconds]      Live TV tuning: TV static at once, then plays the URL of the first stdin
+ *                                           line "url <URL>" (the static stays until its first picture). End of
+ *                                           stdin or SIGTERM before the URL: exit 0. Hiss volume from SLJF_STATIC
+ *                                           (unset = 0, silent static)
+ *   stdin: control lines from sljfd, "osd ..." = the on-screen bar (sljf-subs.c, osd_command), "url ..." (--static).
+ *   End of stdin is ignored when playing (sljf-test gives none) and ends --card.
  *   SIGTERM stops it.  Exit code: 0 ended/stopped, 3 the stream broke.
  *   No pause: starving SLVideo does not pause it (its queue clock keeps running, tried 2026-11-19, the sync then
  *   threw away audio non-stop). sljfd pauses by stopping sljf-play and starting it again at the same position.
@@ -23,6 +27,10 @@
  *                      TV: it arrives at exactly real time, so without a cushion every network hiccup empties the
  *                      audio queue, the sound falls behind and the sync cuts it = stutter). 0 = off (files, default)
  *   env SLJF_SUBS      SRT file: draw these subtitles on an SLVideo overlay (sljf-subs.c); SLJF_SUB_FONT the TTF
+ *   env SLJF_STATIC    Live TV: show TV static (sljf-static.c) with a hiss at this volume (0-100 % of full scale,
+ *                      0 = silent) while the stream opens and prebuffers and whenever the video queue has been empty
+ *                      700 ms after the picture started; prints "static on" / "static off". Unset: no static
+ *                      (films, episodes: as without this feature). Subtitles and the bar are not drawn under it.
  *   env SLJF_VOLUME    0-100 (default 100 = untouched): software volume, the Link itself always sends full-scale
  *                      audio over HDMI. stdin "volume N" changes it while playing (heard within the ~1 s queued).
  * Prints one status line per second: queued video ms, queued audio ms, packets, dropped, A/V offset, CPU time.
@@ -54,6 +62,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include "sljf-static.h"
 
 #define AUDIO_RATE 48000
 #define AUDIO_CH 2
@@ -64,6 +73,10 @@
 #define SYNC_SLACK_MS 45         /* leave smaller A/V offsets alone */
 #define SYNC_MAX_MS 3000         /* largest single correction */
 
+#if AUDIO_CHUNK_BYTES != STATIC_AUDIO_CHUNK_BYTES
+#error "the static's audio stream is handed to the player: same chunk size"
+#endif
+
 #define FIFO_MAX 4096            /* read-ahead packets (~25 s of 25 fps video + audio) */
 
 int subs_init(CSLVideoContext *vctx);    /* sljf-subs.c */
@@ -73,6 +86,7 @@ void osd_command(const char *line);
 void osd_tick(double t);
 
 static volatile int g_stop;
+static char g_url[4096];                 /* from a "url <URL>" stdin line (--static) */
 static void on_signal(int s) { (void)s; g_stop = 1; }
 
 /* Volume: gain in 1/65536 steps on the s16 samples, squared from 0-100 so the steps sound even (50 = -12 dB,
@@ -82,6 +96,7 @@ static void set_volume(int v) {
     if (v < 0) v = 0;
     if (v > 100) v = 100;
     g_gain = (v * v * 65536 + 5000) / 10000;
+    static_set_gain(g_gain);                            /* the static's hiss: same level relative to the show */
     printf("volume %d\n", v);
 }
 static void apply_gain(uint8_t *pcm, int bytes) {
@@ -170,7 +185,13 @@ static int read_ctl(void) {
         char *nl;
         while ((nl = strchr(buf, '\n'))) {
             *nl = 0;
-            if (!strncmp(buf, "volume ", 7)) set_volume(atoi(buf + 7));
+            if (!strncmp(buf, "url ", 4)) {
+                if (!g_url[0]) {
+                    snprintf(g_url, sizeof g_url, "%s", buf + 4);
+                    size_t l = strlen(g_url); if (l && g_url[l - 1] == '\r') g_url[l - 1] = 0;   /* CRLF writer */
+                }
+            }
+            else if (!strncmp(buf, "volume ", 7)) set_volume(atoi(buf + 7));
             else osd_command(buf);
             fill -= (int)(nl + 1 - buf);
             memmove(buf, nl + 1, fill + 1);
@@ -193,7 +214,7 @@ static int card(void) {
 
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--version")) { puts(SLJF_VERSION); return 0; }
-    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds] | --card | --version\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: sljf-play <url> [seconds] | --static [seconds] | --card | --version\n"); return 2; }
     if (!strcmp(argv[1], "--card")) {
         signal(SIGINT, on_signal); signal(SIGTERM, on_signal); setvbuf(stdout, NULL, _IOLBF, 0);
         return card();
@@ -204,6 +225,23 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);                   /* status lines show up over ssh without a tty */
     if (getenv("SLJF_DEBUG")) av_log_set_level(AV_LOG_DEBUG);
     if (getenv("SLJF_VOLUME") && *getenv("SLJF_VOLUME")) set_volume(atoi(getenv("SLJF_VOLUME")));
+
+    /* TV static (Live TV): up before anything slow (the URL wait, the network), so the screen is never black long */
+    int wait_url = !strcmp(argv[1], "--static");
+    int svol = static_volume();
+    if (wait_url && svol < 0) svol = 0;
+    CSLVideoContext *vctx = NULL;
+    if (svol >= 0) {
+        atexit(static_free);                            /* error returns: the overlay and an own audio stream */
+        vctx = SLVideo_CreateContext();
+        if (!vctx) { fprintf(stderr, "SLVideo_CreateContext failed\n"); return 1; }
+        static_show(vctx, svol);
+    }
+    if (wait_url) {                                     /* sljfd writes the URL once the server opened the channel */
+        while (!g_stop && !g_url[0] && read_ctl() >= 0) { static_tick(now_s()); usleep(10000); }
+        if (!g_url[0]) { static_free(); SLVideo_FreeContext(vctx); printf("static: no url, stopped\n"); return 0; }
+        url = g_url;
+    }
 
     AVDictionary *opts = NULL;
     const char *h = getenv("SLJF_HEADERS"), *ua = getenv("SLJF_UA");
@@ -218,10 +256,13 @@ int main(int argc, char **argv) {
     AVFormatContext *fmt = avformat_alloc_context();
     fmt->interrupt_callback.callback = interrupt_cb;   /* copied into the connection at open: set it first */
     double t0 = now_s();
+    static_background(1);                               /* the static keeps moving while these block */
     int err = avformat_open_input(&fmt, url, NULL, &opts);
+    int serr = err < 0 ? 0 : avformat_find_stream_info(fmt, NULL);
+    static_background(0);
     av_dict_free(&opts);
-    if (err < 0) { fprintf(stderr, "open failed: %s\n", av_err2str(err)); return 1; }
-    if ((err = avformat_find_stream_info(fmt, NULL)) < 0) { fprintf(stderr, "no stream info: %s\n", av_err2str(err)); return 1; }
+    if (err < 0) { fprintf(stderr, "open failed: %s\n", av_err2str(err)); return g_stop && svol >= 0 ? 0 : 1; }
+    if ((err = serr) < 0) { fprintf(stderr, "no stream info: %s\n", av_err2str(err)); return g_stop && svol >= 0 ? 0 : 1; }
     printf("opened in %.1f s, format %s\n", now_s() - t0, fmt->iformat->name);
 
     int vi = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -250,12 +291,13 @@ int main(int argc, char **argv) {
         printf("converting to Annex-B\n");
     }
 
-    CSLVideoContext *vctx = SLVideo_CreateContext();
+    if (!vctx) vctx = SLVideo_CreateContext();         /* (made before the open when the static is on) */
     if (!vctx) { fprintf(stderr, "SLVideo_CreateContext failed\n"); return 1; }
     int dw = 0, dh = 0; SLVideo_GetDisplayResolution(vctx, &dw, &dh);
     printf("display %dx%d\n", dw, dh);
     CSLVideoStream *vstr = SLVideo_CreateStream(vctx, k_ESLVideoFormatH264, 0);   /* 0: B-frames allowed, queued */
     if (!vstr) { fprintf(stderr, "SLVideo_CreateStream failed\n"); return 1; }
+    static_tick(now_s());                               /* the static keeps moving through the setup (no-op without) */
     SLVideo_SetStreamVideoTransferMatrix(vstr, k_ESLVideoTransferMatrix_Automatic);
     AVRational fr = vs->avg_frame_rate.num ? vs->avg_frame_rate : vs->r_frame_rate;
     if (fr.num) SLVideo_SetStreamTargetFramerate(vstr, fr.num, fr.den);
@@ -273,12 +315,17 @@ int main(int argc, char **argv) {
             adec = avcodec_alloc_context3(c);
             avcodec_parameters_to_context(adec, as->codecpar);
             if (avcodec_open2(adec, c, NULL) < 0) { fprintf(stderr, "audio decoder open failed\n"); return 1; }
-            actx = SLAudio_CreateContext();
-            astr = actx ? SLAudio_CreateStream(actx, AUDIO_RATE, AUDIO_CH, AUDIO_CHUNK_BYTES, 0) : NULL;
+            static_give_audio(&actx, &astr);          /* the static's own stream, if it made one: no second stream */
+            if (!astr) {
+                actx = SLAudio_CreateContext();
+                astr = actx ? SLAudio_CreateStream(actx, AUDIO_RATE, AUDIO_CH, AUDIO_CHUNK_BYTES, 0) : NULL;
+            }
             if (!astr) { fprintf(stderr, "SLAudio stream failed\n"); return 1; }
+            static_give_audio(&actx, &astr);          /* rebuffer hiss goes into the programme stream */
             printf("audio %s -> s16 stereo 48 kHz\n", c->name);
         }
     }
+    static_tick(now_s());
 
     AVPacket *pkt = av_packet_alloc(), *fpkt = av_packet_alloc();
     AVFrame *afr = av_frame_alloc();
@@ -310,6 +357,7 @@ int main(int argc, char **argv) {
     double start = now_s(), last = start, cpu0 = cpu_s();
     int eof = 0, rc = 0;
     double eof_wait = -1;                             /* when to stop waiting for the decoders after the end */
+    int st_play = 0; double st_dry = 0; long st_frames = 0;   /* static: picture started, video queue last non-empty */
 
     while (!g_stop) {
         double t = now_s();
@@ -317,10 +365,20 @@ int main(int argc, char **argv) {
         double vfed = v_acc + (vframes - n_base) * fdur;     /* seconds of video handed to the decoder */
         uint32_t vq = SLVideo_GetQueuedVideoMS(vstr);
         uint32_t aq = astr ? SLAudio_GetQueuedAudioSamples(astr) * 1000 / AUDIO_RATE : 0;
+        /* TV static: off once the first frame is on screen; on again when the video queue has been empty 700 ms
+           (a single late frame does not flash it), off when frames come in again */
+        if (svol >= 0) {
+            if (eof) static_hide();                   /* nothing more coming; its hiss would also keep aq > 0 */
+            else if (!st_play) { if (v_first >= 0 && vfed - vq / 1000.0 > 0.2) { static_hide(); st_play = 1; st_dry = t; } }
+            else if (static_visible()) { if (vq > 0 && vframes > st_frames) { static_hide(); st_dry = t; } }
+            else if (vq > 0 || eof) st_dry = t;
+            else if (t - st_dry >= 0.7) { static_show(vctx, svol); st_frames = vframes; }
+            static_tick(t);
+        }
         /* where each output is now: audio ahead of the picture = positive */
         /* only once the picture is really moving: the decoder buffers ~1-2 s before it shows the first frame, and
            measuring during that gave several wrong corrections in a row */
-        if (astr && v_first >= 0 && a_end >= 0 && vq > 0 && aq > 0 && !adrop && vfed - vq / 1000.0 > 0.5) {
+        if (astr && v_first >= 0 && a_end >= 0 && vq > 0 && aq > 0 && !adrop && vfed - vq / 1000.0 > 0.5 && !static_visible()) {
             double v_play = v_first + vfed - vq / 1000.0;
             double a_play = a_end - afill / (double)(AUDIO_RATE * AUDIO_CH * 2) - aq / 1000.0;
             sync_sum += a_play - v_play + av_off; sync_n++;
@@ -481,6 +539,7 @@ int main(int argc, char **argv) {
                         memcpy(fr, abuf, AUDIO_CHUNK_BYTES);
                         apply_gain(fr, AUDIO_CHUNK_BYTES);
                         SLAudio_SubmitFrame(astr);
+                        static_prog_audio();          /* programme sound: the static's hiss stops */
                         afill -= AUDIO_CHUNK_BYTES;
                         memmove(abuf, abuf + AUDIO_CHUNK_BYTES, afill);
                     }
@@ -498,6 +557,7 @@ int main(int argc, char **argv) {
     while (fifo_n) { av_packet_free(&fifo[fifo_head]); fifo_head = (fifo_head + 1) % FIFO_MAX; fifo_n--; }
     printf("stopped after %.1f s: %ld video frames (%ld failed), %ld audio packets\n",
            now_s() - start, vframes, vfail, apk);
+    static_free();                                    /* before the contexts go; the shared stream is ours now */
     subs_free();                                      /* subtitles and the bar */
     if (astr) SLAudio_FreeStream(astr);
     if (actx) SLAudio_FreeContext(actx);

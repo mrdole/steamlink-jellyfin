@@ -28,6 +28,18 @@ fi
 for f in scripts/*.sh scripts/bump-version tools/make-sync-test.sh; do bash -n "$f" || bad "bash -n $f"; done
 for f in daemon/sljfd.init daemon/arm-cc app/run.sh tools/sljf-memwatch; do sh -n "$f" || bad "sh -n $f"; done
 ok "shell scripts parse"
+if command -v node >/dev/null; then
+    node app/test/guide.test.js >/dev/null && ok "app/guide.js tests" || bad "app/guide.js tests (node app/test/guide.test.js)"
+else
+    echo "skip app/guide.js tests (node not found)"
+fi
+if command -v cc >/dev/null; then
+    T=$(mktemp -d)
+    cc -std=c99 -Wall -Wextra -O2 player/test/static-gen-test.c player/static-gen.c -lm -o "$T/sgt" && "$T/sgt" >/dev/null && ok "player static generators" || bad "player static generators (player/test/static-gen-test.c)"
+    rm -rf "$T"
+else
+    echo "skip player static generators (cc not found)"
+fi
 for f in tools/sljf-login tools/sljf-test tools/sljf-remote app/shot.py; do
     python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" || bad "python parse $f"
 done

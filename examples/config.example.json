@@ -11,5 +11,7 @@
   "ca": "/mnt/scratch/sljf/ca.pem",
   "lan_allow": ["192.0.2.10"],
   "lan_port": 8098,
-  "open_app_at_boot": false
+  "open_app_at_boot": false,
+  "live_tv_static": true,
+  "static_volume": 8
 }

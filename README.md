@@ -12,14 +12,16 @@ Not affiliated with Valve or the Jellyfin project.
 
 ## What it does
 
-- **On-TV app**: a "Jellyfin" tile on the Link's home screen. Continue Watching, Next Up, Live TV, Libraries, Search,
-  audio and subtitle track choice. It returns to where you were after playback.
+- **On-TV app**: a "Jellyfin" tile on the Link's home screen. It opens on its own home screen (JELLYFIN, LIVE TV,
+  STEAM). Continue Watching, Next Up, Live TV, Libraries, Search, audio and subtitle track choice. It returns to where
+  you were after playback.
 - **Playback** through the Link's H.264 decoder: H.264 8-bit up to 1080p is copied as is; anything else (HEVC,
   10-bit, 4K) is re-encoded by the Jellyfin server. Audio is always converted to stereo AAC by the server.
 - **Subtitles**: text tracks drawn on the Link; picture tracks (PGS, VobSub) burned in by the server.
 - **Remote control**: shows up in Jellyfin as a device you can cast to and control (play, pause, seek, stop, tracks,
   d-pad), which also makes it a `media_player` in Home Assistant's Jellyfin integration.
-- **Live TV** channels from Jellyfin's Live TV (tested with ErsatzTV over an M3U tuner).
+- **Live TV** channels from Jellyfin's Live TV (tested with ErsatzTV over an M3U tuner), with a TV guide, and TV
+  static with a faint hiss while a channel tunes or rebuffers (both can be turned off).
 - **Recovery**: restarts playback where it was after network drops or server hiccups, reconnects after reboots.
 
 ## Integrations (all optional)
