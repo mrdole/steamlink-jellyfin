@@ -7,6 +7,13 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Fixed
+- Live TV static flashing on and off more and more the longer a channel played: once the stream ran behind, the
+  player fed each packet as it came and the static went up whenever the decoder's queue read empty, although the
+  picture was still moving. The static now needs the picture to have stopped (no new frame for 700 ms), the player
+  reads up to 12 s ahead instead of 4 so good stretches rebuild a cushion, and the frame-rate measurement no longer
+  jumps (slow motion) when the stream skips ahead.
+
 ## [0.1.0-alpha.5] - 2026-11-21
 
 ### Added

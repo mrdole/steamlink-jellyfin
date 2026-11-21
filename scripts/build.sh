@@ -75,7 +75,7 @@ eval "set -- $CC"; GCC=$1   # cross gcc; we pass our own sysroot flags
 $GCC --sysroot="$MARVELL_ROOTFS" $MARVELL_RPATH_LINK_OPTIONS $CFLAGS_ARM -std=gnu99 -Wall -DSLJF_VERSION="\"$VERSION\"" \
   -I"$PREFIX/include" -I"$MARVELL_ROOTFS/usr/include" -I"$MARVELL_ROOTFS/usr/include/freetype2" \
   -o "$HERE/out/sljf-play" "$HERE/player/sljf-play.c" "$HERE/player/sljf-subs.c" \
-  "$HERE/player/sljf-static.c" "$HERE/player/static-gen.c" \
+  "$HERE/player/sljf-static.c" "$HERE/player/static-gen.c" "$HERE/player/live-buf.c" \
   -L"$PREFIX/lib" -lavformat -lavcodec -lswresample -lavutil -lmbedtls -lmbedx509 -lmbedcrypto \
   -lSLVideo -lSLAudio -lfreetype -lpthread -lm 2>&1 | grep -v "^$" || true
 [ -f "$HERE/out/sljf-play" ] || { echo "build failed"; exit 1; }
