@@ -36,6 +36,10 @@ const WANT_EVERY: Duration = Duration::from_secs(10);
 const EVICT_EVERY: Duration = Duration::from_secs(60);
 /// A failed item lookup is not tried again for this long (each try can block up to the Api timeout).
 const INFO_RETRY: Duration = Duration::from_secs(60);
+/// Rejoins of one item in a row before the run gives up on it and lets the queue cut to the next item.
+const REJOIN_MAX: u32 = 3;
+/// A rejoined item that plays this long (s) before it fails again starts a fresh count.
+const REJOIN_CLEAR: f64 = 60.0;
 
 // ---- local time ------------------------------------------------------------------------------------------------
 
@@ -139,6 +143,10 @@ pub struct Chans {
     /// ids asked of the lookup thread and not answered yet
     asked: Arc<Mutex<HashSet<String>>>,
     lookup_tx: Option<Sender<String>>,
+    /// the last rejoin: (schedule end of the item, rejoins of it in a row); cleared by a new tune
+    rejoins: Option<(f64, u32)>,
+    /// the last fetch list, by name: a kept (playing) cache job is re-wanted from here when its lookup is gone
+    last_jobs: HashMap<String, Job>,
     /// last channel watched (idle fetch-ahead)
     last: Option<u32>,
     run: u64,
@@ -154,7 +162,7 @@ impl Chans {
         Chans {
             lineup: None, loading: None, retry_at: None, day_check: now, zone_logged: false, stick: None, stick_at: now,
             clips: Vec::new(), scan: None, fetcher: None, want_at: now, evict_at: now + EVICT_EVERY, info: InfoMap::default(),
-            asked: Arc::default(), lookup_tx: None, last: None, run: 0, lines_tx, lines_rx, play: None,
+            asked: Arc::default(), lookup_tx: None, rejoins: None, last_jobs: HashMap::new(), last: None, run: 0, lines_tx, lines_rx, play: None,
         }
     }
 
@@ -176,6 +184,18 @@ impl Chans {
         let w = *RETRY_S.get(exits.checked_sub(1)? as usize)?;
         Some(if exits > 1 { w as f64 } else { 0.0 })
     }
+}
+
+/// An item (schedule end `key`) ended early and wants a rejoin after playing `played` s. Returns the wait before the
+/// restart (None: give up on it, the queue cuts to the next item) and the new rejoin state. The count is per item and
+/// starts over when the item had played REJOIN_CLEAR s; waits follow `Chans::restart_wait`.
+fn rejoin_step(prev: Option<(f64, u32)>, key: f64, played: f64) -> (Option<f64>, (f64, u32)) {
+    let count = match prev {
+        Some((k, n)) if (k - key).abs() < 0.01 && played < REJOIN_CLEAR => n + 1,
+        _ => 1,
+    };
+    let wait = if count > REJOIN_MAX { None } else { Chans::restart_wait(count) };
+    (wait, (key, count))
 }
 
 /// The channel's entries from `t`, its filler from the stick's clips or the server's pools.
@@ -461,11 +481,18 @@ impl Player {
         }
         let mut jobs = Vec::new();
         for id in ids {
-            let Some(info) = self.ch.info_of(&id) else { continue }; // asked; next round
+            let Some(info) = self.ch.info_of(&id) else {
+                // a kept download must stay wanted even if its lookup is gone (the map is cleared past 2000 items)
+                if let Some(j) = self.ch.last_jobs.get(&job_name(&id)) {
+                    jobs.push(j.clone());
+                }
+                continue; // asked; next round
+            };
             let tr = Tracks { audio: info.audio, ..Default::default() };
             let url = self.stream_url(&id, info.copy, &tr, &session_id(), 0, None);
             jobs.push(Job { name: job_name(&id), url, byte_rate_cap: rate_cap(info.bitrate, self.cfg.fetch_rate) });
         }
+        self.ch.last_jobs = jobs.iter().map(|j| (j.name.clone(), j.clone())).collect();
         jobs
     }
 
@@ -497,6 +524,7 @@ impl Player {
         self.queue.clear();
         self.qi = 0;
         self.ch.last = Some(number);
+        self.ch.rejoins = None;
         let name = format!("{number} {}", l.snap.channels[i].name);
         self.shared.channel(&channel_id(number));
         self.shared.playing(true, false, &name);
@@ -648,7 +676,7 @@ impl Player {
         let now = now_f();
         let mut ended_sessions = Vec::new();
         let mut banner = false;
-        let mut rejoin = false;
+        let mut rejoin: Option<f64> = None;
         while let Ok((run, line)) = self.ch.lines_rx.try_recv() {
             let Some(cp) = self.ch.play.as_mut() else { continue };
             if run != cp.feed.run {
@@ -669,9 +697,19 @@ impl Player {
                 }
                 Event::Ended(s) => {
                     if rejoin_after(&s, now) {
-                        log(&format!("channel {}: item {} ended {:.0} s early{}: rejoining from the server", cp.name, s.seq,
-                            s.started.unwrap_or(now) + s.len - now, if s.broke { " after a stream error" } else { " (from a file)" }));
-                        rejoin = true;
+                        let early = s.started.unwrap_or(now) + s.len - now;
+                        let why = if s.broke { " after a stream error" } else { " (from a file)" };
+                        let (wait, st) = rejoin_step(self.ch.rejoins, s.sched_end, now - s.started.unwrap_or(now));
+                        self.ch.rejoins = Some(st);
+                        match wait {
+                            Some(w) => {
+                                log(&format!("channel {}: item {} ended {early:.0} s early{why}: rejoining from the server in {w:.0} s ({}/{REJOIN_MAX})",
+                                    cp.name, s.seq, st.1));
+                                rejoin = Some(w);
+                            }
+                            None => log(&format!("channel {}: item {} ended {early:.0} s early{why} again: going on with the next item",
+                                cp.name, s.seq)),
+                        }
                     }
                     ended_sessions.extend(s.session);
                 }
@@ -681,9 +719,9 @@ impl Player {
         for s in ended_sessions {
             self.end_encode_bg(s);
         }
-        if rejoin {
+        if let Some(wait) = rejoin {
             let (exits, fail_key) = self.ch.play.as_ref().map(|cp| (cp.exits, cp.fail_key)).unwrap_or((0, None));
-            return self.chan_restart(0.0, 0.0, exits, fail_key);
+            return self.chan_restart(0.0, wait, exits, fail_key);
         }
         if banner {
             self.chan_osd(5);
@@ -826,6 +864,24 @@ mod tests {
         assert!(!job_ids(&es, now, true, &[]).contains(&"a".to_string()));
         // idle: the next episode only
         assert_eq!(job_ids(&es, now, false, &[]), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn rejoins_back_off_then_cut_to_the_next_item() {
+        let k = 1000.0;
+        let (w, st) = rejoin_step(None, k, 5.0);
+        assert_eq!((w, st), (Some(0.0), (k, 1)));
+        let (w, st) = rejoin_step(Some(st), k, 5.0);
+        assert_eq!((w, st), (Some(4.0), (k, 2)));
+        let (w, st) = rejoin_step(Some(st), k, 5.0);
+        assert_eq!((w, st), (Some(8.0), (k, 3)));
+        let (w, st) = rejoin_step(Some(st), k, 5.0);
+        assert_eq!(w, None); // a fourth time: give up on it, the queue cuts to the next item
+        assert_eq!(rejoin_step(Some(st), k, 5.0).0, None); // and stays given up
+        // played long enough before failing again: a fresh count
+        assert_eq!(rejoin_step(Some(st), k, REJOIN_CLEAR + 1.0), (Some(0.0), (k, 1)));
+        // another item: a fresh count
+        assert_eq!(rejoin_step(Some(st), 2800.0, 5.0), (Some(0.0), (2800.0, 1)));
     }
 
     #[test]
