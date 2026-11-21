@@ -13,8 +13,11 @@ pub struct Ep {
     pub id: String,
     pub secs: u32,
     pub title: String,
+    /// "S1E2" ("" for a film)
     pub episode: String,
     pub overview: String,
+    /// series name ("" for a film): the guide's programme name
+    pub series: String,
 }
 
 /// A film is a Show with one Ep.
@@ -173,11 +176,13 @@ pub fn now(ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64)> {
 /// The key is the channel number plus epoch and padding mode; a rebuilt channel (different shows) must call
 /// `forget` so a stale cursor is not reused.
 #[derive(Default)]
+#[allow(dead_code)] // not used yet: engine.rs replays `slots` from the epoch (~1 ms per call on the host in 2027)
 pub struct Scheduler {
     /// Value: (end of the last answered slot, cursor just after it).
     cache: Mutex<HashMap<(u32, i64, bool), (i64, Cursor)>>,
 }
 
+#[allow(dead_code)]
 impl Scheduler {
     pub fn now(&self, ch: &ChannelDef, r: &Rules, t: i64) -> Option<(Slot, i64)> {
         if !valid_t(r, t) {
@@ -206,7 +211,7 @@ mod tests {
     const EPOCH: i64 = 1_767_225_600 + 6 * 3600;
 
     fn ep(id: &str, secs: u32) -> Ep {
-        Ep { id: id.into(), secs, title: id.into(), episode: String::new(), overview: String::new() }
+        Ep { id: id.into(), secs, title: id.into(), episode: String::new(), overview: String::new(), series: String::new() }
     }
 
     fn show(id: &str, n: usize, secs: u32) -> Show {

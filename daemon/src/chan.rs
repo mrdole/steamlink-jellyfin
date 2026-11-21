@@ -97,6 +97,7 @@ fn ep_from(item: &Value) -> Option<Ep> {
         title: item["Name"].as_str().unwrap_or("").to_string(),
         episode,
         overview: item["Overview"].as_str().unwrap_or("").to_string(),
+        series: item["SeriesName"].as_str().unwrap_or("").to_string(),
     })
 }
 
@@ -299,7 +300,7 @@ pub fn snapshot_to_json(s: &Snapshot) -> Value {
                     let eps: Vec<Value> = sh
                         .eps
                         .iter()
-                        .map(|e| json!({"id": e.id, "secs": e.secs, "title": e.title, "episode": e.episode, "overview": e.overview}))
+                        .map(|e| json!({"id": e.id, "secs": e.secs, "title": e.title, "episode": e.episode, "overview": e.overview, "series": e.series}))
                         .collect();
                     json!({"id": sh.id, "eps": eps})
                 })
@@ -332,6 +333,8 @@ pub fn snapshot_from_saved(v: &Value) -> Option<Snapshot> {
                     title: e["title"].as_str()?.to_string(),
                     episode: e["episode"].as_str()?.to_string(),
                     overview: e["overview"].as_str()?.to_string(),
+                    // (absent in a file saved before it was added)
+                    series: e["series"].as_str().unwrap_or("").to_string(),
                 });
             }
             shows.push(Show { id: sh["id"].as_str()?.to_string(), eps });
