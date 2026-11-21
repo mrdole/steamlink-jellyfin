@@ -1584,7 +1584,7 @@ impl Player {
                     }
                 } else if line.starts_with("end of stream") {
                     n.eof = true;
-                } else if ["opened", "video h264", "frame rate", "played out", "sync:", "subs:", "prebuffered", "read-ahead", "stream error", "open failed", "no ", "video is", "SL", "audio decoder", "static"].iter().any(|p| line.starts_with(p)) {
+                } else if ["opened", "video h264", "frame rate", "played out", "sync:", "subs:", "prebuffered", "rebuffer", "read-ahead", "stream error", "open failed", "no ", "video is", "SL", "audio decoder", "static"].iter().any(|p| line.starts_with(p)) {
                     log(&format!("player: {line}"));
                 }
             }
