@@ -7,6 +7,19 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Added
+- TV channels built on the box (release 1a): Jellyfin collections, or the user's own playlists, named
+  `Channel <N> <name>` become channels in the TV guide and on the home screen. Shows rotate marathon-style, episodes
+  in order, specials left out; the schedule comes from the clock, so a channel joins mid-episode and boxes agree.
+  Keys in [CONFIG.md](docs/CONFIG.md#tv-channels).
+- Bumpers and commercials pad slots to :00 / :30, from `Bumpers` / `Commercials` collections or playlists, or from
+  a USB stick with a top-level `sljf/` folder (FAT32 or ext2/3/4). The stick also caches upcoming programmes.
+  A silent "Up next" card fills any gap nothing fits.
+- `sljf-play --channel` (items queued over stdin, cuts without a gap when the picture size matches) and
+  `sljf-play --probe FILE`; sljfd serves cached items to the player on `/cache`.
+- Not in this release: breaks inside episodes, loudness matching, subtitles on channels, a server-Date clock
+  fallback, skipping the re-encode.
+
 ## [0.1.0-alpha.6] - 2026-11-21
 
 ### Fixed
