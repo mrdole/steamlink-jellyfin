@@ -169,7 +169,10 @@ int item_open(struct item *it, const char *url, AVDictionary *opts) {
     it->fmt = avformat_alloc_context();
     it->fmt->interrupt_callback.callback = interrupt_cb;   /* copied into the connection at open: set it first */
     it->fmt->interrupt_callback.opaque = it;
-    int err = avformat_open_input(&it->fmt, url, NULL, &opts);
+    AVDictionary *o = NULL;                           /* the open rewrites (and frees) the dictionary it is given: use a copy */
+    av_dict_copy(&o, opts, 0);
+    int err = avformat_open_input(&it->fmt, url, NULL, &o);
+    av_dict_free(&o);
     if (err < 0) { fprintf(stderr, "open failed: %s\n", av_err2str(err)); return err; }   /* (fmt is freed by the failed open) */
     if ((err = avformat_find_stream_info(it->fmt, NULL)) < 0) { fprintf(stderr, "no stream info: %s\n", av_err2str(err)); return err; }
     return 0;
