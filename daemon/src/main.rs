@@ -33,6 +33,8 @@ use tungstenite::{Message, WebSocket};
 mod guide;
 mod local;
 #[allow(dead_code)] // not called from main until the channel engine lands
+mod chan;
+#[allow(dead_code)] // not called from main until the channel engine lands
 mod sched;
 
 /// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
@@ -91,6 +93,7 @@ fn volume_command(name: &str, args: &Value, vol: u8, muted: bool) -> Option<(u8,
 const HOLD: &str = "/tmp/sljf.hold";
 const APP: &str = "/home/apps/jellyfin/run.sh";
 
+#[allow(dead_code)] // the channel keys are read by the channel engine (a later task)
 struct Cfg {
     server: String,
     user_id: String,
@@ -113,6 +116,51 @@ struct Cfg {
     static_volume: u8,
     /// start volume 0-100 for sljf-play (100 = untouched); a remote changes it until sljfd restarts
     volume: u8,
+    // channel keys: read by the channel engine (a later task)
+    /// link-side TV channels from server collections "Channel N Name"
+    channels: bool,
+    channel_prefix: String,
+    show_server_live_tv: bool,
+    /// local time the schedule day starts, seconds after midnight
+    schedule_day_start: i64,
+    /// Some(true/false) forces padding of slots on/off; None = on when the channel has filler pools
+    pad: Option<bool>,
+    /// "between" or "off"
+    breaks: String,
+    break_minutes: u32,
+    cache_gb: Option<u32>,
+    fetch_rate: f64,
+}
+
+fn cfg_day_start(v: &Value) -> i64 {
+    const DEFAULT: i64 = 6 * 3600;
+    if v.is_null() {
+        return DEFAULT;
+    }
+    let parsed = v.as_str().and_then(|s| {
+        let (h, m) = s.trim().split_once(':')?;
+        if h.len() != 2 || m.len() != 2 {
+            return None;
+        }
+        let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+        ((0..24).contains(&h) && (0..60).contains(&m)).then_some(h * 3600 + m * 60)
+    });
+    parsed.unwrap_or_else(|| {
+        log(&format!("config: schedule_day_start {v} is not HH:MM, using 06:00"));
+        DEFAULT
+    })
+}
+
+fn cfg_breaks(v: &Value) -> String {
+    match v.as_str() {
+        None if v.is_null() => "between".into(),
+        Some("between") => "between".into(),
+        Some("off") => "off".into(),
+        _ => {
+            log(&format!("config: breaks {v} not understood, using \"between\""));
+            "between".into()
+        }
+    }
 }
 
 impl Cfg {
@@ -140,6 +188,15 @@ impl Cfg {
             live_tv_static: v["live_tv_static"].as_bool().unwrap_or(true),
             static_volume: v["static_volume"].as_u64().map(|n| n.min(100) as u8).unwrap_or(8),
             volume: cfg_volume(&v["volume"]),
+            channels: v["channels"].as_bool().unwrap_or(true),
+            channel_prefix: s("channel_prefix", "Channel"),
+            show_server_live_tv: v["show_server_live_tv"].as_bool().unwrap_or(false),
+            schedule_day_start: cfg_day_start(&v["schedule_day_start"]),
+            pad: v["pad"].as_bool(),
+            breaks: cfg_breaks(&v["breaks"]),
+            break_minutes: v["break_minutes"].as_i64().map(|n| n.clamp(0, 10) as u32).unwrap_or(2),
+            cache_gb: v["cache_gb"].as_u64().map(|n| n.min(u32::MAX as u64) as u32),
+            fetch_rate: v["fetch_rate"].as_f64().filter(|x| x.is_finite()).map(|x| x.clamp(1.0, 8.0)).unwrap_or(2.0),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
             return Err(format!("{path}: server, user_id and token are required (run sljf-login)"));
@@ -1863,6 +1920,36 @@ mod tests {
         assert!(!c.live_tv_static);
         assert_eq!(c.static_volume, 100);
         assert_eq!(parse(",\"static_volume\":0").static_volume, 0);
+    }
+
+    #[test]
+    fn cfg_channel_defaults() {
+        let c = parse("");
+        assert!(c.channels);
+        assert_eq!(c.channel_prefix, "Channel");
+        assert!(!c.show_server_live_tv);
+        assert_eq!(c.schedule_day_start, 21600);
+        assert_eq!(c.pad, None);
+        assert_eq!(c.breaks, "between");
+        assert_eq!(c.break_minutes, 2);
+        assert_eq!(c.cache_gb, None);
+        assert_eq!(c.fetch_rate, 2.0);
+    }
+
+    #[test]
+    fn cfg_channel_values_clamped() {
+        let c = parse(",\"break_minutes\":99,\"fetch_rate\":0,\"schedule_day_start\":\"25:00\",\"breaks\":\"sometimes\"");
+        assert_eq!(c.break_minutes, 10);
+        assert_eq!(c.fetch_rate, 1.0);
+        assert_eq!(c.schedule_day_start, 21600);
+        assert_eq!(c.breaks, "between");
+        let c = parse(",\"fetch_rate\":50,\"break_minutes\":-4,\"schedule_day_start\":\"05:30\",\"breaks\":\"off\",\"pad\":false,\"cache_gb\":8");
+        assert_eq!(c.fetch_rate, 8.0);
+        assert_eq!(c.break_minutes, 0);
+        assert_eq!(c.schedule_day_start, 19800);
+        assert_eq!(c.breaks, "off");
+        assert_eq!(c.pad, Some(false));
+        assert_eq!(c.cache_gb, Some(8));
     }
 
     #[test]
