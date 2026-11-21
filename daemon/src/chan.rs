@@ -5,7 +5,11 @@ use crate::sched::{ChannelDef, Ep, Show};
 use crate::{log, Api, Cfg};
 use serde_json::{json, Value};
 
-pub const CHANNELS_FILE: &str = "/mnt/scratch/sljf/cache/channels.json";
+pub fn channels_file() -> String {
+    format!("{}/channels.json", crate::local::CACHE)
+}
+
+type Fetch<'a> = &'a dyn Fn(&str) -> Result<Value, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PoolKind {
@@ -115,14 +119,30 @@ fn series_eps(episodes_json: &Value, season_id: Option<&str>) -> Vec<Ep> {
     v.into_iter().map(|(_, _, e)| e).collect()
 }
 
-fn shows_of(children_json: &Value, episodes: &dyn Fn(&str) -> Value) -> Vec<Show> {
-    let mut shows = Vec::new();
+fn shows_of(children_json: &Value, episodes: Fetch, playlist: bool) -> Result<Vec<Show>, String> {
+    let mut shows: Vec<Show> = Vec::new();
+    // playlist episodes grouped by series: (index of its Show in `shows`, raw episode items); the Show is a
+    // placeholder at the series' first position in the playlist and gets its sorted episodes at the end
+    let mut groups: Vec<(usize, Vec<Value>)> = Vec::new();
     for c in items(children_json) {
         let Some(id) = c["Id"].as_str() else { continue };
-        let eps = match c["Type"].as_str().unwrap_or("") {
-            "Series" => series_eps(&episodes(id), None),
+        let ty = c["Type"].as_str().unwrap_or("");
+        if playlist && ty == "Episode" {
+            if let Some(sid) = c["SeriesId"].as_str() {
+                match groups.iter_mut().find(|(i, _)| shows[*i].id == sid) {
+                    Some((_, v)) => v.push(c.clone()),
+                    None => {
+                        groups.push((shows.len(), vec![c.clone()]));
+                        shows.push(Show { id: sid.to_string(), eps: Vec::new() });
+                    }
+                }
+                continue;
+            }
+        }
+        let eps = match ty {
+            "Series" => series_eps(&episodes(id)?, None),
             "Season" => match c["SeriesId"].as_str() {
-                Some(sid) => series_eps(&episodes(sid), Some(id)),
+                Some(sid) => series_eps(&episodes(sid)?, Some(id)),
                 None => Vec::new(),
             },
             "Movie" | "Video" | "Episode" => ep_from(c).into_iter().collect(),
@@ -132,7 +152,11 @@ fn shows_of(children_json: &Value, episodes: &dyn Fn(&str) -> Value) -> Vec<Show
             shows.push(Show { id: id.to_string(), eps });
         }
     }
-    shows
+    for (i, raw) in groups {
+        shows[i].eps = series_eps(&json!({ "Items": raw }), None);
+    }
+    shows.retain(|s| !s.eps.is_empty());
+    Ok(shows)
 }
 
 fn clips_of(children_json: &Value) -> Vec<ServerClip> {
@@ -148,32 +172,32 @@ fn clips_of(children_json: &Value) -> Vec<ServerClip> {
 
 pub fn snapshot_from_json(
     collections: &Value,
-    children: &dyn Fn(&str) -> Value,
-    episodes: &dyn Fn(&str) -> Value,
+    children: Fetch,
+    episodes: Fetch,
     prefix: &str,
     day: i64,
-) -> Snapshot {
-    let mut cols: Vec<(&str, &str)> = items(collections)
+) -> Result<Snapshot, String> {
+    let mut cols: Vec<(&str, &str, bool)> = items(collections)
         .iter()
-        .filter_map(|c| Some((c["Id"].as_str()?, c["Name"].as_str()?)))
+        .filter_map(|c| Some((c["Id"].as_str()?, c["Name"].as_str()?, c["Type"].as_str() == Some("Playlist"))))
         .collect();
     cols.sort();
     let mut channels: Vec<ChannelDef> = Vec::new();
     let mut pools = Vec::new();
-    for (id, name) in cols {
+    for (id, name, playlist) in cols {
         if let Some((number, title)) = parse_channel_name(name, prefix) {
             if channels.iter().any(|c| c.number == number) {
                 log(&format!("channels: duplicate number {number} ({id}) ignored"));
                 continue;
             }
-            let shows = shows_of(&children(id), episodes);
+            let shows = shows_of(&children(id)?, episodes, playlist)?;
             if shows.is_empty() {
                 log(&format!("channels: {name} has nothing playable, skipped"));
                 continue;
             }
             channels.push(ChannelDef { number, name: title, collection_id: id.to_string(), shows, filler: false });
         } else if let Some((kind, n)) = pool_name(name) {
-            let clips = clips_of(&children(id));
+            let clips = clips_of(&children(id)?);
             if !clips.is_empty() {
                 pools.push((kind, n, clips));
             }
@@ -183,30 +207,77 @@ pub fn snapshot_from_json(
     for c in &mut channels {
         c.filler = pools.iter().any(|(_, n, _)| n.is_none() || *n == Some(c.number));
     }
-    Snapshot { day, channels, pools }
+    Ok(Snapshot { day, channels, pools })
 }
 
+/// Reads the user's playlists' items, paged.
+fn playlist_items(api: &Api, uid: &str, pid: &str) -> Result<Value, String> {
+    let mut all: Vec<Value> = Vec::new();
+    loop {
+        let r = api.get(&format!(
+            "/Playlists/{pid}/Items?UserId={uid}&Fields=Overview&StartIndex={}&Limit=500",
+            all.len()
+        ))?;
+        let page = items(&r);
+        all.extend(page.iter().cloned());
+        let total = r["TotalRecordCount"].as_u64().unwrap_or(0) as usize;
+        if page.is_empty() || all.len() >= total {
+            return Ok(json!({ "Items": all }));
+        }
+    }
+}
+
+/// Reads channels and pools from the server. Any failed request is an Err (nothing is persisted), so the caller
+/// keeps its previous snapshot and tries again later.
 pub fn load_snapshot(api: &Api, cfg: &Cfg, day: i64) -> Result<Snapshot, String> {
     let uid = &cfg.user_id;
     let cols = api.get(&format!("/Users/{uid}/Items?IncludeItemTypes=BoxSet&Recursive=true&Fields="))?;
+    let lists = api.get(&format!("/Users/{uid}/Items?IncludeItemTypes=Playlist&Recursive=true&Fields="))?;
+    let mut merged: Vec<Value> = items(&cols).to_vec();
+    let mut playlist_ids: Vec<String> = Vec::new();
+    for p in items(&lists) {
+        let mut p = p.clone();
+        p["Type"] = json!("Playlist");
+        if let Some(id) = p["Id"].as_str() {
+            playlist_ids.push(id.to_string());
+        }
+        merged.push(p);
+    }
+    let merged = json!({ "Items": merged });
     let children = |cid: &str| {
-        api.get(&format!("/Users/{uid}/Items?ParentId={cid}&Fields=Overview")).unwrap_or_else(|e| {
-            log(&format!("channels: {e}"));
-            Value::Null
-        })
+        if playlist_ids.iter().any(|p| p == cid) {
+            playlist_items(api, uid, cid)
+        } else {
+            api.get(&format!("/Users/{uid}/Items?ParentId={cid}&Fields=Overview"))
+        }
     };
-    let episodes = |sid: &str| {
-        api.get(&format!("/Shows/{sid}/Episodes?UserId={uid}&Fields=Overview")).unwrap_or_else(|e| {
-            log(&format!("channels: {e}"));
-            Value::Null
-        })
-    };
-    let snap = snapshot_from_json(&cols, &children, &episodes, &cfg.channel_prefix, day);
-    let _ = std::fs::create_dir_all(crate::local::CACHE);
-    if let Err(e) = std::fs::write(CHANNELS_FILE, snapshot_to_json(&snap).to_string()) {
-        log(&format!("channels: cannot write {CHANNELS_FILE}: {e}"));
+    let episodes = |sid: &str| api.get(&format!("/Shows/{sid}/Episodes?UserId={uid}&Fields=Overview"));
+    let snap = snapshot_from_json(&merged, &children, &episodes, &cfg.channel_prefix, day)?;
+    if let Err(e) = write_atomic(&channels_file(), &snapshot_to_json(&snap).to_string()) {
+        log(&format!("channels: cannot write {}: {e}", channels_file()));
     }
     Ok(snap)
+}
+
+fn write_atomic(path: &str, text: &str) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(crate::local::CACHE);
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Today's snapshot: the saved one if it is for `day`, else a fresh load (persisted only on success).
+pub fn load_or_fetch(api: &Api, cfg: &Cfg, day: i64) -> Result<Snapshot, String> {
+    if let Some(s) = std::fs::read_to_string(channels_file())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| snapshot_from_saved(&v))
+    {
+        if s.day == day {
+            return Ok(s);
+        }
+    }
+    load_snapshot(api, cfg, day)
 }
 
 fn kind_str(k: PoolKind) -> &'static str {
@@ -326,7 +397,7 @@ mod tests {
             {"Id":"c4","Name":"Bumpers"},
             {"Id":"c5","Name":"Commercials 2"},
             {"Id":"c6","Name":"Other"}]}"#);
-        let children = |cid: &str| match cid {
+        let children = |cid: &str| Ok(match cid {
             "c1" => j(r#"{"Items":[{"Id":"s1","Type":"Series","Name":"Show"},
                 {"Id":"sea9","Type":"Season","SeriesId":"s9","Name":"Season 2"}]}"#),
             "c2" => j(r#"{"Items":[{"Id":"m9","Type":"Movie","Name":"X","RunTimeTicks":6000000000}]}"#),
@@ -334,8 +405,8 @@ mod tests {
             "c4" => j(r#"{"Items":[{"Id":"b1","RunTimeTicks":100000000},{"Id":"b2"}]}"#),
             "c5" => j(r#"{"Items":[{"Id":"k1","RunTimeTicks":300000000}]}"#),
             _ => Value::Null,
-        };
-        let episodes = |sid: &str| match sid {
+        });
+        let episodes = |sid: &str| Ok(match sid {
             "s1" => j(r#"{"Items":[
                 {"Id":"e3","Name":"C","ParentIndexNumber":2,"IndexNumber":1,"RunTimeTicks":13200000000},
                 {"Id":"e0","Name":"Special","ParentIndexNumber":0,"IndexNumber":1,"RunTimeTicks":13200000000},
@@ -346,8 +417,8 @@ mod tests {
                 {"Id":"f1","Name":"F1","ParentIndexNumber":1,"IndexNumber":1,"SeasonId":"sea8","RunTimeTicks":9000000000},
                 {"Id":"f2","Name":"F2","ParentIndexNumber":2,"IndexNumber":1,"SeasonId":"sea9","RunTimeTicks":9000000000}]}"#),
             _ => Value::Null,
-        };
-        snapshot_from_json(&cols, &children, &episodes, "Channel", 5)
+        });
+        snapshot_from_json(&cols, &children, &episodes, "Channel", 5).unwrap()
     }
 
     #[test]
@@ -377,19 +448,80 @@ mod tests {
     #[test]
     fn empty_collection_skipped() {
         let cols = j(r#"{"Items":[{"Id":"c1","Name":"Channel 4 Empty"}]}"#);
-        let s = snapshot_from_json(&cols, &|_| j(r#"{"Items":[]}"#), &|_| Value::Null, "Channel", 1);
+        let s = snapshot_from_json(&cols, &|_| Ok(j(r#"{"Items":[]}"#)), &|_| Ok(Value::Null), "Channel", 1).unwrap();
         assert!(s.channels.is_empty());
     }
 
     #[test]
     fn filler_only_for_matching_pool() {
         let cols = j(r#"{"Items":[{"Id":"c1","Name":"Channel 4 A"},{"Id":"c2","Name":"Commercials 9"}]}"#);
-        let ch = |cid: &str| match cid {
-            "c1" => j(r#"{"Items":[{"Id":"m","Type":"Movie","RunTimeTicks":600000000}]}"#),
-            _ => j(r#"{"Items":[{"Id":"k","RunTimeTicks":600000000}]}"#),
+        let ch = |cid: &str| {
+            Ok(match cid {
+                "c1" => j(r#"{"Items":[{"Id":"m","Type":"Movie","RunTimeTicks":600000000}]}"#),
+                _ => j(r#"{"Items":[{"Id":"k","RunTimeTicks":600000000}]}"#),
+            })
         };
-        let s = snapshot_from_json(&cols, &ch, &|_| Value::Null, "Channel", 1);
+        let s = snapshot_from_json(&cols, &ch, &|_| Ok(Value::Null), "Channel", 1).unwrap();
         assert!(!s.channels[0].filler);
+    }
+
+    #[test]
+    fn fetch_error_fails_snapshot() {
+        let cols = j(r#"{"Items":[{"Id":"c1","Name":"Channel 4 A"},{"Id":"c2","Name":"Channel 5 B"}]}"#);
+        let ch = |cid: &str| {
+            if cid == "c2" {
+                Err("boom".to_string())
+            } else {
+                Ok(j(r#"{"Items":[{"Id":"m","Type":"Movie","RunTimeTicks":600000000}]}"#))
+            }
+        };
+        assert!(snapshot_from_json(&cols, &ch, &|_| Ok(Value::Null), "Channel", 1).is_err());
+        let ep_err = |_: &str| Err("boom".to_string());
+        let ch2 = |_: &str| Ok(j(r#"{"Items":[{"Id":"s","Type":"Series"}]}"#));
+        assert!(snapshot_from_json(&cols, &ch2, &ep_err, "Channel", 1).is_err());
+    }
+
+    fn pl_item(id: &str, ty: &str, series: &str, s: i64, n: i64) -> String {
+        format!(r#"{{"Id":"{id}","Type":"{ty}","Name":"{id}","SeriesId":"{series}","ParentIndexNumber":{s},"IndexNumber":{n},"RunTimeTicks":13200000000}}"#)
+    }
+
+    fn pl_children(cid: &str) -> Result<Value, String> {
+        Ok(match cid {
+            "p1" => j(&format!(
+                r#"{{"Items":[{},{},{},{},{},{{"Id":"mv","Type":"Movie","RunTimeTicks":54000000000}}]}}"#,
+                pl_item("a3", "Episode", "A", 2, 1),
+                pl_item("b1", "Episode", "B", 1, 1),
+                pl_item("a1", "Episode", "A", 1, 1),
+                pl_item("b2", "Episode", "B", 1, 2),
+                pl_item("a2", "Episode", "A", 1, 2)
+            )),
+            "p0" => j(r#"{"Items":[{"Id":"mx","Type":"Movie","RunTimeTicks":54000000000}]}"#),
+            _ => Value::Null,
+        })
+    }
+
+    #[test]
+    fn playlist_channel_groups_by_series() {
+        let cols = j(r#"{"Items":[{"Id":"p1","Type":"Playlist","Name":"Channel 3 Mix"}]}"#);
+        let s = snapshot_from_json(&cols, &pl_children, &|_| Ok(Value::Null), "Channel", 1).unwrap();
+        assert_eq!(s.channels.len(), 1);
+        let sh = &s.channels[0].shows;
+        assert_eq!(sh.len(), 3);
+        assert_eq!(sh[0].id, "A");
+        assert_eq!(sh[1].id, "B");
+        assert_eq!(sh[2].id, "mv");
+        let a: Vec<&str> = sh[0].eps.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(a, vec!["a1", "a2", "a3"]);
+    }
+
+    #[test]
+    fn playlist_and_collection_same_number_lower_id_wins() {
+        let cols = j(r#"{"Items":[
+            {"Id":"p1","Type":"Playlist","Name":"Channel 3 Mix"},
+            {"Id":"p0","Type":"BoxSet","Name":"Channel 3 Coll"}]}"#);
+        let s = snapshot_from_json(&cols, &pl_children, &|_| Ok(Value::Null), "Channel", 1).unwrap();
+        assert_eq!(s.channels.len(), 1);
+        assert_eq!(s.channels[0].collection_id, "p0");
     }
 
     #[test]

@@ -195,7 +195,7 @@ impl Cfg {
             pad: v["pad"].as_bool(),
             breaks: cfg_breaks(&v["breaks"]),
             break_minutes: v["break_minutes"].as_i64().map(|n| n.clamp(0, 10) as u32).unwrap_or(2),
-            cache_gb: v["cache_gb"].as_u64().map(|n| n.min(u32::MAX as u64) as u32),
+            cache_gb: v["cache_gb"].as_u64().filter(|&n| n > 0).map(|n| n.min(u32::MAX as u64) as u32),
             fetch_rate: v["fetch_rate"].as_f64().filter(|x| x.is_finite()).map(|x| x.clamp(1.0, 8.0)).unwrap_or(2.0),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {

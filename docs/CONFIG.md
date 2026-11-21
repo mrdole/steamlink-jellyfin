@@ -26,8 +26,10 @@ Example with every key: [examples/config.example.json](../examples/config.exampl
 
 ## TV channels
 
-Collections on the Jellyfin server named `Channel 10 Classic Sitcoms` become TV channels on the Link; collections named
-`Bumpers` / `Commercials` (optionally with a channel number, `Commercials 10`) are the filler that pads the gaps.
+Collections or playlists on the Jellyfin server named `Channel 10 Classic Sitcoms` become TV channels on the Link; collections named
+`Bumpers` / `Commercials` (optionally with a channel number, `Commercials 10`) are the filler that pads the gaps. Playlists work the same way and
+suit a Link account that may not create collections: episodes in a playlist are grouped into one show per series,
+and a movie is its own show. A collection and a playlist with the same channel number: the lower id wins.
 
 | Key | Default | What |
 |---|---|---|
@@ -38,7 +40,7 @@ Collections on the Jellyfin server named `Channel 10 Classic Sitcoms` become TV 
 | `pad` | auto | `true`/`false` forces padding of each slot to the half hour on/off; absent = pad when the channel has Bumpers/Commercials |
 | `breaks` | `"between"` | `"between"` plays filler between programmes; `"off"` plays none. Anything else = `"between"` |
 | `break_minutes` | `2` | Length of a break in minutes, 0-10 |
-| `cache_gb` | auto | Disk the Link may use to cache upcoming programmes, in GB; absent = chosen from free space |
+| `cache_gb` | auto | Disk the Link may use to cache upcoming programmes, in GB; absent or `0` = chosen from free space |
 | `fetch_rate` | `2.0` | How many times faster than real time upcoming programmes are fetched, 1-8 |
 
 ## Optional integrations
