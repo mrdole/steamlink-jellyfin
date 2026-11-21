@@ -94,6 +94,10 @@ fn card_text(title: &str, at: f64, utc_off: i64) -> String {
     format!("Up next: {title} at {}", hhmm(at, utc_off))
 }
 
+fn url_line(url: &str) -> Option<String> {
+    (!url.contains(['\n', '\r'])).then(|| format!("url {url}\n"))
+}
+
 /// One line for the player's stdin: no control characters.
 fn clean(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
@@ -267,6 +271,19 @@ pub struct Sent {
     /// Cache file it plays from (keep it from eviction), server play session (end its encode afterwards).
     pub cache: Option<String>,
     pub session: Option<String>,
+    /// Plays from a file (the cache or the stick), not straight from the server.
+    pub file: bool,
+    /// The player reported a stream error while it played.
+    pub broke: bool,
+}
+
+/// An item ended at `now`: start the run again so it rejoins on air from the server? Yes when it ended more than
+/// DRIFT s before its time after a stream error, or when it played from a file (the stick was pulled, a cached
+/// download stalled). An item straight from the server that just ends early (its file is shorter than the metadata
+/// says) is not: the filler covers it.
+pub fn rejoin_after(s: &Sent, now: f64) -> bool {
+    let Some(st) = s.started else { return false };
+    st + s.len - now > DRIFT && (s.broke || s.file)
 }
 
 /// Where an item plays from (built by the daemon: stream URL, /cache URL or stick path).
@@ -277,13 +294,17 @@ pub struct Resolved {
     pub session: Option<String>,
 }
 
-/// The first item of a run: its URL (the `url` line, due at `send_at`), and `--channel <limit>`, SLJF_START.
+/// The first item of a run, chosen from the schedule alone (no server lookup, so the player and its static can start
+/// at once): `--channel <limit>`, SLJF_START = `start_secs`; its `url` line goes when `send_at` has come and it resolves.
 #[derive(Debug, Clone, PartialEq)]
-pub struct First {
-    pub url: String,
+pub struct FirstPlan {
+    pub next: Next,
+    pub start_at: f64,
+    pub send_at: f64,
     pub limit: f64,
     pub start_secs: f64,
-    pub send_at: f64,
+    /// end of its entry: past that (less than MIN_PLAY s left) it is given up
+    pub entry_end: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,11 +327,13 @@ pub struct Feed {
     pub last_end: f64,
     /// The player said `queue empty`: send the next at once.
     starved: bool,
+    /// item 1 until its `url` line has gone
+    first: Option<FirstPlan>,
 }
 
 impl Feed {
     pub fn new(run: u64) -> Feed {
-        Feed { run, sent: VecDeque::new(), seq: 0, last_end: 0.0, starved: false }
+        Feed { run, sent: VecDeque::new(), seq: 0, last_end: 0.0, starved: false, first: None }
     }
 
     fn push(&mut self, at: f64, len: f64, sched_end: f64, title: &str, video: bool, r: Option<&Resolved>) {
@@ -318,12 +341,14 @@ impl Feed {
         self.sent.push_back(Sent {
             seq: self.seq, at, len, sched_end, started: None, title: title.to_string(), video,
             cache: r.and_then(|r| r.cache.clone()), session: r.and_then(|r| r.session.clone()),
+            file: r.is_some_and(|r| r.session.is_none()), broke: false,
         });
     }
 
-    /// Picks the first item (the entry on air at `now`, or the first after `skip_until`; cards are waited out behind
-    /// the static) and registers it as item 1.
-    pub fn first(&mut self, es: &[Entry], now: f64, skip_until: f64, resolve: &mut dyn FnMut(&Next) -> Option<Resolved>) -> Option<First> {
+    /// Plans the first item (the entry on air at `now`, or the first ending after `skip_until`; cards are waited out
+    /// behind the static) from the schedule alone and registers it as item 1. `cached`: a cached copy from its start
+    /// exists, worth up to DRIFT s of lateness (the filler absorbs it).
+    pub fn plan_first(&mut self, es: &[Entry], now: f64, skip_until: f64, cached: &dyn Fn(&Next) -> bool) -> Option<FirstPlan> {
         for e in es {
             let end = e.at + e.len;
             if end <= skip_until + 0.01 || end <= now + MIN_PLAY || matches!(e.next, Next::Card { .. }) {
@@ -331,30 +356,57 @@ impl Feed {
             }
             let start_at = now.max(e.at);
             let late = start_at - e.at;
-            let mut pick = None;
-            // a cached copy from the start is worth up to DRIFT s of lateness (the filler absorbs it)
-            if late > 0.0 && late <= DRIFT {
-                if let Some((nx, play)) = place(e, start_at, DRIFT) {
-                    pick = resolve(&nx).filter(|r| r.cache.is_some()).map(|r| (nx, play, r));
-                }
-            }
-            if pick.is_none() {
-                if let Some((nx, play)) = place(e, start_at, 0.0) {
-                    pick = resolve(&nx).map(|r| (nx, play, r));
-                }
-            }
-            let Some((nx, play, r)) = pick else { continue };
-            let (limit, start_secs) = match &nx {
+            let slack = if late > 0.0 && late <= DRIFT && cached(&e.next) { DRIFT } else { 0.0 };
+            let Some((next, play)) = place(e, start_at, slack) else { continue };
+            let (limit, start_secs) = match &next {
                 Next::Video { start_secs, limit_secs, .. } => (*limit_secs, *start_secs),
                 Next::Clip { limit_secs, .. } => (*limit_secs, 0.0),
                 Next::Card { .. } => continue,
             };
-            self.push(start_at, play, end, &e.title, matches!(nx, Next::Video { .. }), Some(&r));
+            self.push(start_at, play, end, &e.title, matches!(next, Next::Video { .. }), None);
             self.last_end = end;
             let send_at = if e.at > now { e.at - OPEN_AHEAD } else { now };
-            return Some(First { url: r.url, limit, start_secs, send_at });
+            let plan = FirstPlan { next, start_at, send_at, limit, start_secs, entry_end: end };
+            self.first = Some(plan.clone());
+            return Some(plan);
         }
         None
+    }
+
+    /// The `url` line of item 1 once it is due and resolves (None: not yet; the static stays meanwhile). An episode
+    /// that resolves more than DRIFT s late is joined that much further in. Err(end of its entry): its time ran out
+    /// unresolved; start a run past it.
+    pub fn first_line(&mut self, now: f64, resolve: &mut dyn FnMut(&Next) -> Option<Resolved>) -> Option<Result<String, f64>> {
+        let p = self.first.as_ref()?;
+        if now < p.send_at {
+            return None;
+        }
+        if now >= p.entry_end - MIN_PLAY {
+            let end = p.entry_end;
+            self.first = None;
+            return Some(Err(end));
+        }
+        let mut next = p.next.clone();
+        let delay = now - p.start_at;
+        if let Next::Video { start_secs, .. } = &mut next {
+            if delay > DRIFT {
+                *start_secs += delay;
+            }
+        }
+        let r = resolve(&next)?;
+        let line = url_line(&r.url)?;
+        self.first = None;
+        if let Some(s) = self.sent.iter_mut().find(|s| s.seq == 1) {
+            s.cache = r.cache.clone();
+            s.session = r.session.clone();
+            s.file = r.session.is_none();
+        }
+        Some(Ok(line))
+    }
+
+    /// Item 1's `url` line is still to go.
+    pub fn first_pending(&self) -> bool {
+        self.first.is_some()
     }
 
     pub fn on_line(&mut self, run: u64, line: &str, now: f64) -> Event {
@@ -380,6 +432,12 @@ impl Feed {
                 }
             }
             ["item", n, "open", f, ..] if n.ends_with(':') && f.starts_with("failed") => num(n).map(Event::OpenFailed).unwrap_or(Event::Other),
+            ["stream", "error:", ..] => {
+                if let Some(s) = self.sent.iter_mut().find(|s| s.started.is_some()) {
+                    s.broke = true;
+                }
+                Event::Other
+            }
             ["queue", "empty"] => {
                 self.starved = true;
                 Event::Starved
@@ -463,6 +521,9 @@ impl Feed {
 
     /// The player exited: Some(end of the item it never started) = that item failed to open; None = rejoin on air.
     pub fn restart_skip(&self) -> Option<f64> {
+        if self.first.is_some() {
+            return None; // its url never went: it did not fail
+        }
         self.sent.front().filter(|s| s.started.is_none()).map(|s| s.sched_end)
     }
 
@@ -643,8 +704,10 @@ mod tests {
     fn started_feed(run: u64) -> (Feed, f64) {
         let mut f = Feed::new(run);
         let now = EPOCH as f64 + 100.0;
-        let first = f.first(&es_from(now), now, 0.0, &mut res).unwrap();
-        assert_eq!(first, First { url: "http://s/a".into(), limit: 1220.0, start_secs: 100.0, send_at: now });
+        let p = f.plan_first(&es_from(now), now, 0.0, &|_| false).unwrap();
+        assert_eq!((p.limit, p.start_secs, p.send_at), (1220.0, 100.0, now));
+        assert_eq!(f.first_line(now, &mut res), Some(Ok("url http://s/a\n".to_string())));
+        assert_eq!(f.sent[0].session.as_deref(), Some("ses-a"));
         assert_eq!(f.on_line(run, "item 1 start", now + 1.0), Event::Started(f.sent[0].clone()));
         (f, now + 1.0)
     }
@@ -758,34 +821,79 @@ mod tests {
         // the first item failing to open: the player exits; the restart skips it (when it failed before)
         let mut g = Feed::new(2);
         let now = EPOCH as f64 + 100.0;
-        g.first(&es_from(now), now, 0.0, &mut res).unwrap();
+        g.plan_first(&es_from(now), now, 0.0, &|_| false).unwrap();
+        assert_eq!(g.restart_skip(), None); // its url had not gone yet: not a failure
+        g.first_line(now, &mut res).unwrap().unwrap();
         assert_eq!(g.restart_skip(), Some(EPOCH as f64 + 1320.0));
         let mut h = Feed::new(3);
-        let first = h.first(&es_from(now), now, EPOCH as f64 + 1320.0, &mut res).unwrap();
-        assert_eq!(first, First { url: "/b1".into(), limit: 100.0, start_secs: 0.0, send_at: EPOCH as f64 + 1320.0 - OPEN_AHEAD });
+        let p = h.plan_first(&es_from(now), now, EPOCH as f64 + 1320.0, &|_| false).unwrap();
+        assert_eq!((p.limit, p.start_secs, p.send_at), (100.0, 0.0, EPOCH as f64 + 1320.0 - OPEN_AHEAD));
+        assert_eq!(h.first_line(now, &mut res), None); // static until it is due
+        assert_eq!(h.first_line(EPOCH as f64 + 1318.0, &mut res), Some(Ok("url /b1\n".to_string())));
         // an item that had started and then broke: rejoin on air
         assert_eq!(started_feed(4).0.restart_skip(), None);
     }
 
     #[test]
-    fn first_waits_out_a_card_and_skips_unresolvable() {
+    fn first_waits_out_a_card_and_for_its_lookup() {
         let mut f = Feed::new(1);
         let now = EPOCH as f64 + 1320.0 + 250.0; // in the card of the first gap
-        let first = f.first(&es_from(now), now, 0.0, &mut res).unwrap();
-        assert_eq!(first.url, "http://s/b");
-        assert_eq!(first.send_at, EPOCH as f64 + 1800.0 - OPEN_AHEAD);
+        let p = f.plan_first(&es_from(now), now, 0.0, &|_| false).unwrap();
+        assert!(matches!(&p.next, Next::Video { item_id, .. } if item_id == "b"));
+        assert_eq!(p.send_at, EPOCH as f64 + 1800.0 - OPEN_AHEAD);
+        // not resolvable yet (lookup pending / server down): the static stays, nothing stops; once its time is up,
+        // the caller starts a run past it
         let mut g = Feed::new(1);
-        let mut only_clips = |n: &Next| if matches!(n, Next::Video { .. }) { None } else { res(n) };
-        let first = g.first(&es_from(EPOCH as f64), EPOCH as f64, 0.0, &mut only_clips).unwrap();
-        assert_eq!(first.url, "/b1");
+        let mut nothing = |_: &Next| None;
+        g.plan_first(&es_from(EPOCH as f64), EPOCH as f64, 0.0, &|_| false).unwrap();
+        assert_eq!(g.first_line(EPOCH as f64 + 10.0, &mut nothing), None);
+        assert!(g.first_pending());
+        assert_eq!(g.first_line(EPOCH as f64 + 1319.0, &mut nothing), Some(Err(EPOCH as f64 + 1320.0)));
+        assert!(!g.first_pending());
+        // resolved 30 s late: joined 30 s further in
+        let mut h = Feed::new(1);
+        h.plan_first(&es_from(EPOCH as f64 + 100.0), EPOCH as f64 + 100.0, 0.0, &|_| false).unwrap();
+        let mut seen = 0.0;
+        let mut rec = |n: &Next| {
+            if let Next::Video { start_secs, .. } = n {
+                seen = *start_secs;
+            }
+            res(n)
+        };
+        h.first_line(EPOCH as f64 + 130.0, &mut rec).unwrap().unwrap();
+        assert_eq!(seen, 130.0);
         // a cached copy from the start beats a seek of up to DRIFT s
         let mut c = Feed::new(1);
         let mut cached = |n: &Next| match n {
             Next::Video { start_secs, .. } if *start_secs == 0.0 => Some(Resolved { url: "http://127.0.0.1/cache?f=a-0.ts".into(), cache: Some("a-0.ts".into()), session: None }),
             _ => res(n),
         };
-        let first = c.first(&es_from(EPOCH as f64), EPOCH as f64 + 3.0, 0.0, &mut cached).unwrap();
-        assert_eq!((first.start_secs, first.url.contains("cache")), (0.0, true));
+        let p = c.plan_first(&es_from(EPOCH as f64), EPOCH as f64 + 3.0, 0.0, &|n| matches!(n, Next::Video { .. })).unwrap();
+        assert_eq!(p.start_secs, 0.0);
+        assert!(c.first_line(EPOCH as f64 + 3.0, &mut cached).unwrap().unwrap().contains("cache"));
         assert_eq!(c.in_use(), vec!["a-0.ts".to_string()]);
+        assert!(c.sent[0].file);
+    }
+
+    #[test]
+    fn rejoin_only_for_file_items_or_stream_errors() {
+        let (mut f, t) = started_feed(1); // item 1 straight from the server, due to end at 1321
+        let e = EPOCH as f64;
+        assert!(!rejoin_after(&f.sent[0], e + 600.0)); // just shorter than its metadata: the filler covers it
+        assert!(!rejoin_after(&f.sent[0], e + 1318.0)); // on time
+        f.on_line(1, "stream error: Connection reset by peer, cutting to the next item", t + 10.0);
+        assert!(f.sent[0].broke);
+        assert!(rejoin_after(&f.sent[0], e + 600.0));
+        let (mut g, _) = started_feed(1);
+        g.sent[0].file = true; // from the cache or the stick: ended 700 s early (stick pulled, download stalled)
+        assert!(rejoin_after(&g.sent[0], e + 600.0));
+        assert!(!rejoin_after(&g.sent[0], e + 1317.0)); // within DRIFT of its end
+        g.sent[0].started = None;
+        assert!(!rejoin_after(&g.sent[0], e + 600.0)); // never started: an open failure, not a rejoin
+        // a stick clip resolves as a file
+        let mut h = Feed::new(1);
+        h.plan_first(&es_from(e + 1320.0), e + 1320.0, 0.0, &|_| false).unwrap();
+        h.first_line(e + 1320.0, &mut res).unwrap().unwrap();
+        assert!(h.sent[0].file);
     }
 }

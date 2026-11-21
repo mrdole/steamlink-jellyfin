@@ -8,19 +8,22 @@
 //!            Player lines carry the run number they came from, so a flipped-away player never touches the new one.
 //!   failures an item that cannot be opened is skipped by the player; a player that exits is started again (the
 //!            item on air, rejoined at its offset; an item that failed to open twice is skipped, static meanwhile).
+//!            An item from a file (cache, stick) that ends early, or any item after a stream error, restarts the run
+//!            so the item on air is rejoined from the server. The static is up before any server lookup: item
+//!            lookups run in a thread, and an item that does not resolve keeps the static up (never a stop).
 //!   stick    usb::poll every 5 s; clips scanned in a thread; the Fetcher fetches the next items of the channel
 //!            (idle: the next item of the last one watched); evicted to the cache budget every minute.
 //! No reports to the server for channel items (no watched state, no resume points); no subtitles in 1a.
-use crate::engine::{Entry, Event, Feed, Lineup, Next, Resolved, channel_id, entries, slot_filler};
+use crate::engine::{Entry, Event, Feed, Lineup, Next, Resolved, channel_id, entries, rejoin_after, slot_filler};
 use crate::fetch::{FAT_MAX, FileState, Fetcher, Job, rate_cap};
 use crate::filler::{Clip, ClipLoc, pick_pools};
 use crate::sched::{ChannelDef, Rules, epoch_for};
-use crate::{Cfg, PLAYER_SILENT, Player, RETRY_S, TICKS, Tracks, chan, end_player, fetch, keep_awake, local, log, pick_audio, session_id, take_screen_fast, url_line, usb, video_decodable};
+use crate::{Api, Cfg, PLAYER_SILENT, Player, RETRY_S, TICKS, Tracks, chan, end_player, fetch, keep_awake, local, log, pick_audio, session_id, take_screen_fast, usb, video_decodable};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::Child;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -89,13 +92,15 @@ fn job_name(id: &str) -> String {
 
 // ---- state -----------------------------------------------------------------------------------------------------
 
-/// What the stream URL of an item needs (looked up once per item).
+/// What the stream URL of an item needs (looked up once per item, in a thread).
 #[derive(Clone)]
 struct Info {
     copy: bool,
     audio: Option<i64>,
     bitrate: u64,
 }
+
+type InfoMap = Arc<Mutex<HashMap<String, Result<Info, Instant>>>>;
 
 /// One `sljf-play --channel` run.
 pub struct ChanPlay {
@@ -106,8 +111,10 @@ pub struct ChanPlay {
     bar: String,
     child: Option<Child>,
     feed: Feed,
-    /// the first item's `url` line, sent at that wall time
-    url: Option<(f64, String)>,
+    /// item 1's url line has gone (the silence watchdog runs from then on)
+    url_sent: bool,
+    /// nothing could be planned (an empty schedule): try again then
+    replan_at: Option<Instant>,
     last_line: Instant,
     /// player exits in a row (reset when an item starts)
     exits: u32,
@@ -120,6 +127,7 @@ pub struct Chans {
     loading: Option<Receiver<Result<Lineup, String>>>,
     retry_at: Option<Instant>,
     day_check: Instant,
+    zone_logged: bool,
     stick: Option<usb::Stick>,
     stick_at: Instant,
     clips: Vec<(chan::PoolKind, Option<u32>, Clip)>,
@@ -127,7 +135,10 @@ pub struct Chans {
     fetcher: Option<Fetcher>,
     want_at: Instant,
     evict_at: Instant,
-    info: HashMap<String, Result<Info, Instant>>,
+    info: InfoMap,
+    /// ids asked of the lookup thread and not answered yet
+    asked: Arc<Mutex<HashSet<String>>>,
+    lookup_tx: Option<Sender<String>>,
     /// last channel watched (idle fetch-ahead)
     last: Option<u32>,
     run: u64,
@@ -141,9 +152,29 @@ impl Chans {
         let (lines_tx, lines_rx) = channel();
         let now = Instant::now();
         Chans {
-            lineup: None, loading: None, retry_at: None, day_check: now, stick: None, stick_at: now, clips: Vec::new(), scan: None,
-            fetcher: None, want_at: now, evict_at: now + EVICT_EVERY, info: HashMap::new(), last: None, run: 0, lines_tx, lines_rx, play: None,
+            lineup: None, loading: None, retry_at: None, day_check: now, zone_logged: false, stick: None, stick_at: now,
+            clips: Vec::new(), scan: None, fetcher: None, want_at: now, evict_at: now + EVICT_EVERY, info: InfoMap::default(),
+            asked: Arc::default(), lookup_tx: None, last: None, run: 0, lines_tx, lines_rx, play: None,
         }
+    }
+
+    /// Today's lineup has channels: only then does the stick / fetch / channel machinery run.
+    fn active(&self) -> bool {
+        self.lineup.as_ref().is_some_and(|l| !l.snap.channels.is_empty())
+    }
+
+    fn info_of(&self, id: &str) -> Option<Info> {
+        self.info.lock().unwrap().get(id).and_then(|r| r.as_ref().ok().cloned())
+    }
+
+    fn pending(&self, id: &str) -> bool {
+        self.asked.lock().unwrap().contains(id)
+    }
+
+    /// The wait before a player run is started again after exit number `exits` in a row (None: give up).
+    fn restart_wait(exits: u32) -> Option<f64> {
+        let w = *RETRY_S.get(exits.checked_sub(1)? as usize)?;
+        Some(if exits > 1 { w as f64 } else { 0.0 })
     }
 }
 
@@ -162,6 +193,60 @@ fn server_id(n: &Next) -> Option<&str> {
     }
 }
 
+/// Items to fetch ahead: `keep` first (cache files the run plays from that are still downloading: dropping them
+/// from the list would cancel the download under the player), then the next server items that have not started
+/// (playing: episodes and server clips, 3; idle: the next episode).
+fn job_ids(es: &[Entry], now: f64, playing: bool, keep: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for n in keep {
+        if let Some(id) = n.strip_suffix("-0.ts") {
+            if !ids.iter().any(|x| x == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    let mut more = 0;
+    for e in es {
+        if more == if playing { 3 } else { 1 } {
+            break;
+        }
+        if e.at < now - 1.0 || !(playing || matches!(e.next, Next::Video { .. })) {
+            continue;
+        }
+        if let Some(id) = server_id(&e.next) {
+            if !ids.iter().any(|x| x == id) {
+                ids.push(id.to_string());
+                more += 1;
+            }
+        }
+    }
+    ids
+}
+
+/// Looks items up for chan_resolve (one thread, one item at a time; answers go into `info`).
+fn lookup_thread(api: Api<'static>, uid: String, shared: Arc<local::Shared>, info: InfoMap, asked: Arc<Mutex<HashSet<String>>>, rx: Receiver<String>) {
+    for id in rx {
+        let r = match api.get(&format!("/Users/{uid}/Items/{id}")) {
+            Ok(item) => Ok(Info {
+                copy: video_decodable(&item),
+                audio: pick_audio(&item, None, &shared.lang()),
+                bitrate: item["MediaSources"][0]["Bitrate"].as_u64().unwrap_or(0),
+            }),
+            Err(e) => {
+                log(&format!("channel item {id}: {e}"));
+                Err(Instant::now())
+            }
+        };
+        let mut m = info.lock().unwrap();
+        if m.len() > 2000 {
+            m.clear();
+        }
+        m.insert(id.clone(), r);
+        drop(m);
+        asked.lock().unwrap().remove(&id);
+    }
+}
+
 impl Player {
     fn lineup_channel(&self, number: u32) -> Option<(Arc<Lineup>, usize)> {
         let l = self.ch.lineup.clone()?;
@@ -173,6 +258,9 @@ impl Player {
 
     pub fn chan_house(&mut self) {
         self.chan_lineup();
+        if !self.ch.active() {
+            return; // no channels: today's behaviour (no stick handling, no fetching)
+        }
         if self.ch.stick_at.elapsed() >= STICK_POLL {
             self.ch.stick_at = Instant::now();
             self.chan_stick();
@@ -188,7 +276,7 @@ impl Player {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.ch.fetcher.is_some() && self.ch.want_at.elapsed() >= WANT_EVERY {
+        if self.ch.want_at.elapsed() >= WANT_EVERY {
             self.ch.want_at = Instant::now();
             // re-wanted every time: a job dropped while the cache was off comes back
             let jobs = self.chan_jobs();
@@ -239,6 +327,10 @@ impl Player {
             return;
         }
         let off = utc_offset(now);
+        if !self.ch.zone_logged {
+            self.ch.zone_logged = true;
+            log(&format!("channels: local time is UTC{:+}:{:02} (localtime_r)", off / 3600, (off % 3600).abs() / 60));
+        }
         let rules = rules_for(self.cfg, off);
         let day = (now - rules.epoch).div_euclid(86_400);
         if self.ch.lineup.as_ref().is_some_and(|l| l.snap.day == day) {
@@ -285,40 +377,38 @@ impl Player {
         }
     }
 
-    /// Look up what the stream URL of `id` needs (cached; a failure is not retried for INFO_RETRY).
-    fn chan_info(&mut self, id: &str) -> Option<Info> {
-        match self.ch.info.get(id) {
-            Some(Ok(i)) => return Some(i.clone()),
-            Some(Err(t)) if t.elapsed() < INFO_RETRY => return None,
-            _ => {}
+    /// Ask the lookup thread for the server items in `es` it has not answered (a failure is asked again after
+    /// INFO_RETRY). Never blocks.
+    fn chan_lookup(&mut self, es: &[Entry]) {
+        if self.ch.lookup_tx.is_none() {
+            let (tx, rx) = channel();
+            let (api, uid, shared, info, asked) = (self.api.clone(), self.cfg.user_id.clone(), self.shared.clone(), self.ch.info.clone(), self.ch.asked.clone());
+            std::thread::spawn(move || lookup_thread(api, uid, shared, info, asked, rx));
+            self.ch.lookup_tx = Some(tx);
         }
-        if self.ch.info.len() > 2000 {
-            self.ch.info.clear();
-        }
-        let r = match self.api.get(&format!("/Users/{}/Items/{id}", self.cfg.user_id)) {
-            Ok(item) => Ok(Info {
-                copy: video_decodable(&item),
-                audio: pick_audio(&item, None, &self.shared.lang()),
-                bitrate: item["MediaSources"][0]["Bitrate"].as_u64().unwrap_or(0),
-            }),
-            Err(e) => {
-                log(&format!("channel item {id}: {e}"));
-                Err(Instant::now())
-            }
-        };
-        self.ch.info.insert(id.to_string(), r.clone());
-        r.ok()
-    }
-
-    fn chan_prefetch(&mut self, es: &[Entry]) {
-        for e in es {
-            if let Some(id) = server_id(&e.next) {
-                self.chan_info(id);
+        for id in es.iter().filter_map(|e| server_id(&e.next)) {
+            let need = match self.ch.info.lock().unwrap().get(id) {
+                None => true,
+                Some(Err(t)) => t.elapsed() >= INFO_RETRY,
+                Some(Ok(_)) => false,
+            };
+            if need && self.ch.asked.lock().unwrap().insert(id.to_string()) {
+                if let Some(tx) = &self.ch.lookup_tx {
+                    let _ = tx.send(id.to_string());
+                }
             }
         }
     }
 
-    /// Where an item plays from: a stick path, the cache (fetched from its start), or a server stream.
+    /// A cached copy of the item from its start can be played (stick in, cache on, file downloading or done).
+    fn chan_cached(&self, id: &str) -> Option<String> {
+        let name = job_name(id);
+        let st = self.ch.fetcher.as_ref().map(|f| f.state(&name));
+        (self.ch.stick.is_some() && !fetch::cache_off() && matches!(st, Some(FileState::Growing | FileState::Complete))).then_some(name)
+    }
+
+    /// Where an item plays from: a stick path, the cache (only from its start), or a server stream. None while its
+    /// lookup has not answered (or failed).
     fn chan_resolve(&self, n: &Next) -> Option<Resolved> {
         let (id, start) = match n {
             Next::Card { .. } => return None,
@@ -328,23 +418,21 @@ impl Player {
             Next::Clip { loc: ClipLoc::Server(id), .. } => (id.as_str(), 0.0),
             Next::Video { item_id, start_secs, .. } => (item_id.as_str(), *start_secs),
         };
-        let info = self.ch.info.get(id)?.as_ref().ok()?;
-        let name = job_name(id);
-        let cached = self.ch.fetcher.as_ref().map(|f| f.state(&name));
-        if start < 0.5 && self.ch.stick.is_some() && !fetch::cache_off() && matches!(cached, Some(FileState::Growing | FileState::Complete)) {
-            return Some(Resolved { url: format!("http://127.0.0.1:{}/cache?f={name}", local::PORT), cache: Some(name), session: None });
+        if start < 0.5 {
+            if let Some(name) = self.chan_cached(id) {
+                return Some(Resolved { url: format!("http://127.0.0.1:{}/cache?f={name}", local::PORT), cache: Some(name), session: None });
+            }
         }
+        let info = self.ch.info_of(id)?;
         let session = session_id();
         let tr = Tracks { audio: info.audio, ..Default::default() };
         let url = self.stream_url(id, info.copy, &tr, &session, (start * TICKS) as i64, None);
         Some(Resolved { url, cache: None, session: Some(session) })
     }
 
-    /// Fetch-ahead: the next items of the channel playing (or, idle, the next item of the last one watched).
+    /// Fetch-ahead list (and lookups ahead): the next items of the channel playing (or, idle, the next item of the
+    /// last one watched).
     fn chan_jobs(&mut self) -> Vec<Job> {
-        if self.ch.stick.is_none() {
-            return Vec::new();
-        }
         let (number, playing) = match &self.ch.play {
             Some(cp) => (cp.number, true),
             None if self.now.is_none() => match self.ch.last {
@@ -356,14 +444,24 @@ impl Player {
         let Some((l, i)) = self.lineup_channel(number) else { return Vec::new() };
         let now = now_f();
         let es = chan_entries(&self.ch.clips, &l, &l.snap.channels[i], now as i64, 8);
-        let ids: Vec<String> = es.iter()
-            .filter(|e| e.at >= now - 1.0 && (playing || matches!(e.next, Next::Video { .. })))
-            .filter_map(|e| server_id(&e.next).map(String::from))
-            .take(if playing { 3 } else { 1 })
-            .collect();
+        if playing {
+            self.chan_lookup(&es); // well before feed() needs them
+        }
+        if self.ch.stick.is_none() {
+            return Vec::new();
+        }
+        let keep: Vec<String> = match (&self.ch.play, &self.ch.fetcher) {
+            (Some(cp), Some(f)) => cp.feed.in_use().into_iter().filter(|n| f.state(n) == FileState::Growing).collect(),
+            _ => Vec::new(),
+        };
+        let ids = job_ids(&es, now, playing, &keep);
+        if !playing {
+            let es: Vec<Entry> = es.into_iter().filter(|e| server_id(&e.next).is_some_and(|id| ids.iter().any(|x| x == id))).collect();
+            self.chan_lookup(&es);
+        }
         let mut jobs = Vec::new();
         for id in ids {
-            let Some(info) = self.chan_info(&id) else { continue };
+            let Some(info) = self.ch.info_of(&id) else { continue }; // asked; next round
             let tr = Tracks { audio: info.audio, ..Default::default() };
             let url = self.stream_url(&id, info.copy, &tr, &session_id(), 0, None);
             jobs.push(Job { name: job_name(&id), url, byte_rate_cap: rate_cap(info.bitrate, self.cfg.fetch_rate) });
@@ -405,14 +503,16 @@ impl Player {
         take_screen_fast();
         if self.chan_spawn(number, 0.0, 0.0, 0, None) {
             self.chan_osd(5);
+            self.ch.want_at = Instant::now() - WANT_EVERY; // this channel's fetch list on the next tick
         } else {
             self.shared.ended("");
             self.stop(true);
         }
     }
 
-    /// Start a `sljf-play --channel` run on `number`: the item on air (or the first ending after `skip_until`),
-    /// due no earlier than `delay` s from now. False if nothing could be started.
+    /// Start a `sljf-play --channel` run on `number` (static at once): item 1 is planned from the schedule alone (the
+    /// item on air, or the first ending after `skip_until`, due no earlier than `delay` s from now); its URL follows
+    /// when its lookup answers. False only when the player cannot be started.
     fn chan_spawn(&mut self, number: u32, skip_until: f64, delay: f64, exits: u32, fail_key: Option<f64>) -> bool {
         let Some((l, i)) = self.lineup_channel(number) else { return false };
         let ch = &l.snap.channels[i];
@@ -421,16 +521,15 @@ impl Player {
         let run = self.ch.run;
         let now = now_f();
         let es = chan_entries(&self.ch.clips, &l, ch, now as i64, 10);
-        self.chan_prefetch(&es);
         let mut feed = Feed::new(run);
-        let Some(first) = feed.first(&es, now + delay, skip_until, &mut |n| self.chan_resolve(n)) else {
-            log(&format!("channel {name}: nothing playable"));
-            return false;
-        };
-        let Some(url) = url_line(&first.url) else { return false };
-        let mut cmd = self.player_cmd(&Tracks::default(), (first.start_secs * TICKS) as i64, true);
-        cmd.arg("--channel").arg(format!("{:.2}", first.limit))
-            .env("SLJF_STATIC", self.cfg.static_volume.to_string())
+        let plan = feed.plan_first(&es, now + delay, skip_until, &|n| server_id(n).is_some_and(|id| self.chan_cached(id).is_some()));
+        self.chan_lookup(&es);
+        let mut cmd = self.player_cmd(&Tracks::default(), plan.as_ref().map(|p| (p.start_secs * TICKS) as i64).unwrap_or(0), true);
+        cmd.arg("--channel");
+        if let Some(p) = &plan {
+            cmd.arg(format!("{:.2}", p.limit));
+        }
+        cmd.env("SLJF_STATIC", self.cfg.static_volume.to_string())
             .env("SLJF_READAHEAD_S", if self.ch.stick.is_some() { "20" } else { "60" });
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -449,13 +548,31 @@ impl Player {
                 }
             });
         }
-        log(&format!("channel {name}: run {run}, first item at {:.0} s for {:.0} s{}", first.start_secs, first.limit,
-            if first.send_at > now + 1.0 { format!(", static for {:.0} s", first.send_at - now) } else { String::new() }));
+        match &plan {
+            Some(p) => log(&format!("channel {name}: run {run}, item 1 at {:.0} s for {:.0} s{}", p.start_secs, p.limit,
+                if p.send_at > now + 1.0 { format!(", static for {:.0} s", p.send_at - now) } else { String::new() })),
+            None => log(&format!("channel {name}: run {run}, nothing to plan, static meanwhile")),
+        }
         self.ch.play = Some(ChanPlay {
-            number, bar: name.clone(), name, child: Some(child), feed, url: Some((first.send_at, url)),
-            last_line: Instant::now(), exits, fail_key,
+            number, bar: name.clone(), name, child: Some(child), feed, url_sent: false,
+            replan_at: plan.is_none().then(|| Instant::now() + Duration::from_secs(30)), last_line: Instant::now(), exits, fail_key,
         });
         true
+    }
+
+    /// End this run and start another on the same channel (static up again at once).
+    fn chan_restart(&mut self, skip_until: f64, delay: f64, exits: u32, fail_key: Option<f64>) {
+        let Some(mut cp) = self.ch.play.take() else { return };
+        if let Some(c) = cp.child.take() {
+            end_player(c); // reaps it (kills a hung one)
+        }
+        for s in cp.feed.sessions() {
+            self.end_encode_bg(s);
+        }
+        if !self.chan_spawn(cp.number, skip_until, delay, exits, fail_key) {
+            self.shared.ended("");
+            self.stop(true);
+        }
     }
 
     pub fn chan_write(&mut self, line: &str) {
@@ -484,6 +601,7 @@ impl Player {
         for s in cp.feed.sessions() {
             self.end_encode_bg(s);
         }
+        self.ch.want_at = Instant::now() - WANT_EVERY; // its fetch jobs cancelled on the next tick
         log(&format!("channel {}: stopped", cp.name));
     }
 
@@ -525,11 +643,12 @@ impl Player {
         self.play_channel(to);
     }
 
-    /// Called from tick() while a channel plays: player lines, the first `url`, exits, feeding.
+    /// Called from tick() while a channel plays: player lines, item 1's `url`, exits, rejoins, feeding.
     pub fn chan_tick(&mut self) {
         let now = now_f();
         let mut ended_sessions = Vec::new();
         let mut banner = false;
+        let mut rejoin = false;
         while let Ok((run, line)) = self.ch.lines_rx.try_recv() {
             let Some(cp) = self.ch.play.as_mut() else { continue };
             if run != cp.feed.run {
@@ -548,12 +667,23 @@ impl Player {
                     cp.bar = if s.title.is_empty() { cp.name.clone() } else { format!("{} · {}", cp.name, s.title) };
                     banner |= s.video;
                 }
-                Event::Ended(s) => ended_sessions.extend(s.session),
+                Event::Ended(s) => {
+                    if rejoin_after(&s, now) {
+                        log(&format!("channel {}: item {} ended {:.0} s early{}: rejoining from the server", cp.name, s.seq,
+                            s.started.unwrap_or(now) + s.len - now, if s.broke { " after a stream error" } else { " (from a file)" }));
+                        rejoin = true;
+                    }
+                    ended_sessions.extend(s.session);
+                }
                 _ => {}
             }
         }
         for s in ended_sessions {
             self.end_encode_bg(s);
+        }
+        if rejoin {
+            let (exits, fail_key) = self.ch.play.as_ref().map(|cp| (cp.exits, cp.fail_key)).unwrap_or((0, None));
+            return self.chan_restart(0.0, 0.0, exits, fail_key);
         }
         if banner {
             self.chan_osd(5);
@@ -568,23 +698,41 @@ impl Player {
             keep_awake();
             self.last_awake = Instant::now();
         }
-        let Some(cp) = self.ch.play.as_mut() else { return };
-        if cp.url.as_ref().is_some_and(|(at, _)| now >= *at) {
-            let (_, line) = cp.url.take().unwrap();
-            if let Some(w) = cp.child.as_mut().and_then(|c| c.stdin.as_mut()) {
-                let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+        // item 1's url, once due and looked up (the static stays up meanwhile)
+        if let Some(mut cp) = self.ch.play.take() {
+            let r = cp.feed.first_line(now, &mut |n| self.chan_resolve(n));
+            match r {
+                Some(Ok(line)) => {
+                    if let Some(w) = cp.child.as_mut().and_then(|c| c.stdin.as_mut()) {
+                        let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
+                    }
+                    cp.url_sent = true;
+                    cp.last_line = Instant::now();
+                }
+                Some(Err(end)) => {
+                    log(&format!("channel {}: item 1 could not be looked up in its time, going on past it", cp.name));
+                    let exits = cp.exits;
+                    self.ch.play = Some(cp);
+                    return self.chan_restart(end, 0.0, exits, None);
+                }
+                None => {}
             }
-            cp.last_line = Instant::now();
+            let replan = cp.replan_at.is_some_and(|t| Instant::now() >= t);
+            self.ch.play = Some(cp);
+            if replan {
+                return self.chan_restart(0.0, 0.0, 0, None);
+            }
         }
+        let Some(cp) = self.ch.play.as_mut() else { return };
         let code = match cp.child.as_mut().map(|c| c.try_wait()) {
             Some(Ok(Some(st))) => Some(st.code().unwrap_or(-1)),
-            _ if cp.url.is_none() && cp.last_line.elapsed() > PLAYER_SILENT => Some(-2), // hung (no status lines)
+            _ if cp.url_sent && cp.last_line.elapsed() > PLAYER_SILENT => Some(-2), // hung (no status lines)
             _ => None,
         };
         if let Some(code) = code {
             return self.chan_exited(code);
         }
-        if !cp.feed.wants_more(now) {
+        if cp.feed.first_pending() || !cp.feed.wants_more(now) {
             return;
         }
         let number = cp.number;
@@ -595,7 +743,11 @@ impl Player {
             return self.stop(true);
         };
         let es = chan_entries(&self.ch.clips, &l, &l.snap.channels[i], from, 6);
-        self.chan_prefetch(&es);
+        self.chan_lookup(&es);
+        // a lookup still out for one of the next items: wait for it rather than drop that item
+        if es.iter().take(3).filter_map(|e| server_id(&e.next)).any(|id| self.ch.pending(id)) {
+            return;
+        }
         let Some(mut cp) = self.ch.play.take() else { return };
         let lines = cp.feed.feed(&es, now, l.utc_off, &mut |n| self.chan_resolve(n));
         self.ch.play = Some(cp);
@@ -606,39 +758,30 @@ impl Player {
     }
 
     /// The channel's player ended by itself: start it again (rejoin on air; a first item that failed to open twice
-    /// in a row is skipped, the static covers until the next one is due), or give up after RETRY_S.
+    /// in a row is skipped, the static covers until the next one is due), or give up after RETRY_S exits in a row.
     fn chan_exited(&mut self, code: i32) {
-        let Some(mut cp) = self.ch.play.take() else { return };
-        if let Some(c) = cp.child.take() {
-            end_player(c); // reaps it (kills a hung one)
-        }
-        for s in cp.feed.sessions() {
-            self.end_encode_bg(s);
-        }
+        let Some(cp) = self.ch.play.as_ref() else { return };
         let (skip_until, fail_key) = match cp.feed.restart_skip() {
             Some(end) if cp.fail_key == Some(end) => (end, None),
             Some(end) => (0.0, Some(end)),
             None => (0.0, None),
         };
         let exits = cp.exits + 1;
-        let Some(&wait) = RETRY_S.get(exits as usize - 1) else {
+        let Some(delay) = Chans::restart_wait(exits) else {
             log(&format!("channel {}: player exited (code {code}) {exits} times in a row, giving up", cp.name));
             self.shared.ended("");
             return self.stop(true);
         };
         log(&format!("channel {}: player exited (code {code}), starting it again{}", cp.name,
             if skip_until > 0.0 { " after the item that cannot be opened" } else { "" }));
-        let delay = if exits > 1 { wait as f64 } else { 0.0 };
-        if !self.chan_spawn(cp.number, skip_until, delay, exits, fail_key) {
-            self.shared.ended("");
-            self.stop(true);
-        }
+        self.chan_restart(skip_until, delay, exits, fail_key);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sched::{Ep, Show};
 
     fn cfg(extra: &str) -> Cfg {
         let v: Value = serde_json::from_str(&format!("{{\"server\":\"https://x\",\"user_id\":\"u\",\"token\":\"t\"{extra}}}")).unwrap();
@@ -663,5 +806,34 @@ mod tests {
     #[test]
     fn job_names_are_cache_names() {
         assert!(fetch::valid_name(&job_name("807a5f02c43bb3da713ba94b1f4bf1da")));
+    }
+
+    #[test]
+    fn job_list_keeps_the_playing_cache_item() {
+        let ep = |id: &str| Ep { id: id.into(), secs: 1320, title: id.into(), episode: String::new(), overview: String::new(), series: String::new() };
+        let ch = ChannelDef { number: 1, name: "n".into(), collection_id: "c".into(), shows: vec![Show { id: "s".into(), eps: vec![ep("a"), ep("b"), ep("c")] }], filler: true };
+        let r = Rules { pad: None, break_secs: 0, epoch: epoch_for(6 * 3600, 0) };
+        let bump = Clip { loc: ClipLoc::Stick("/b".into()), secs: 100.0 };
+        let srv = Clip { loc: ClipLoc::Server("k".into()), secs: 100.0 };
+        let es = entries(&ch, &r, &|s| slot_filler(1, s, &[], &[bump.clone(), srv.clone()], 0), r.epoch + 600, 10, 0);
+        let now = (r.epoch + 600) as f64;
+        // "a" plays from a cache file still downloading: kept first, or want() would cancel it under the player
+        let ids = job_ids(&es, now, true, &["a-0.ts".to_string()]);
+        assert_eq!(ids[0], "a");
+        assert!(ids.len() <= 4, "{ids:?}");
+        assert!(ids.contains(&"b".to_string()) && ids.contains(&"k".to_string()));
+        // played straight from the server: the item on air is not fetched (it would start from 0)
+        assert!(!job_ids(&es, now, true, &[]).contains(&"a".to_string()));
+        // idle: the next episode only
+        assert_eq!(job_ids(&es, now, false, &[]), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn restarts_back_off_then_give_up() {
+        assert_eq!(Chans::restart_wait(0), None);
+        assert_eq!(Chans::restart_wait(1), Some(0.0));
+        assert_eq!(Chans::restart_wait(2), Some(4.0));
+        assert_eq!(Chans::restart_wait(RETRY_S.len() as u32), Some(60.0));
+        assert_eq!(Chans::restart_wait(RETRY_S.len() as u32 + 1), None);
     }
 }
