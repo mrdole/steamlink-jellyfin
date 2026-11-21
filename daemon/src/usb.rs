@@ -1,5 +1,4 @@
 //! USB stick on the Link: mount, cache budget, eviction, and the clip scan for bumpers/commercials.
-#![allow(dead_code)] // not called from main until the channel engine lands
 use crate::chan::PoolKind;
 use crate::filler::{Clip, ClipLoc, probe_line};
 use crate::log;

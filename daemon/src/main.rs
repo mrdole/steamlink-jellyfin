@@ -30,15 +30,14 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-#[allow(dead_code)] // not called from main until the channel engine lands
 mod filler;
 mod fetch;
 mod usb;
+mod engine;
 mod guide;
 mod local;
-#[allow(dead_code)] // not called from main until the channel engine lands
 mod chan;
-#[allow(dead_code)] // not called from main until the channel engine lands
+mod chanplay;
 mod sched;
 
 /// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
@@ -97,7 +96,6 @@ fn volume_command(name: &str, args: &Value, vol: u8, muted: bool) -> Option<(u8,
 const HOLD: &str = "/tmp/sljf.hold";
 const APP: &str = "/home/apps/jellyfin/run.sh";
 
-#[allow(dead_code)] // the channel keys are read by the channel engine (a later task)
 struct Cfg {
     server: String,
     user_id: String,
@@ -120,7 +118,6 @@ struct Cfg {
     static_volume: u8,
     /// start volume 0-100 for sljf-play (100 = untouched); a remote changes it until sljfd restarts
     volume: u8,
-    // channel keys: read by the channel engine (a later task)
     /// link-side TV channels from server collections "Channel N Name"
     channels: bool,
     channel_prefix: String,
@@ -573,6 +570,7 @@ struct Player {
     next_label: Option<(usize, String)>, // queue index + "S3E6 Title" of the next item, for the countdown
     volume: u8,                     // 0-100, from config.json, then the remote's SetVolume / VolumeUp / VolumeDown
     muted: bool,
+    ch: chanplay::Chans,            // box channels: lineup, stick, fetcher, the channel playing (chanplay.rs)
 }
 
 /// "Series · S3E5 Episode", "Film (1984)" or "11 Channel · Program" for the on-screen bar
@@ -1204,6 +1202,7 @@ impl Player {
     }
 
     fn stop(&mut self, clear_queue: bool) {
+        self.chan_stop();
         self.kill_standby();
         if self.now.is_some() {
             self.kill_child();
@@ -1325,6 +1324,7 @@ impl Player {
         if let Some(w) = self.now.as_mut().and_then(|n| n.child.as_mut()).and_then(|c| c.stdin.as_mut()) {
             let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
         }
+        self.chan_write(&line);
         self.report("progress", Some("VolumeChange"));
     }
 
@@ -1364,6 +1364,9 @@ impl Player {
     ///   Up      show the bar
     ///   Down    sleep timer: off -> 30 -> 60 -> 90 min -> off
     fn remote_key(&mut self, k: &str) {
+        if self.ch.play.is_some() {
+            return self.chan_key(k);
+        }
         log(&format!("remote {k} during playback"));
         self.auto_eps = 0;
         let (live, paused, pos, runtime) = match self.now.as_ref() {
@@ -1394,13 +1397,7 @@ impl Player {
             }
             "MoveUp" => bar(self, None),
             "MoveDown" => {
-                let left = self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs() / 60);
-                self.sleep_at = match left {
-                    None => Some(SLEEP_STEPS[0]),
-                    Some(m) => SLEEP_STEPS.iter().copied().find(|&s| s > m + 1),
-                }
-                .map(|m| Instant::now() + Duration::from_secs(m * 60));
-                log(&format!("sleep timer: {}", self.sleep_at.map(|t| format!("{} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).unwrap_or_else(|| "off".into())));
+                self.cycle_sleep();
                 let at = self.seek_to.map(|(t, _)| t);
                 bar(self, at)
             }
@@ -1417,7 +1414,21 @@ impl Player {
         }
     }
 
+    /// Sleep timer: off -> 30 -> 60 -> 90 min -> off.
+    fn cycle_sleep(&mut self) {
+        let left = self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs() / 60);
+        self.sleep_at = match left {
+            None => Some(SLEEP_STEPS[0]),
+            Some(m) => SLEEP_STEPS.iter().copied().find(|&s| s > m + 1),
+        }
+        .map(|m| Instant::now() + Duration::from_secs(m * 60));
+        log(&format!("sleep timer: {}", self.sleep_at.map(|t| format!("{} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).unwrap_or_else(|| "off".into())));
+    }
+
     fn next(&mut self, step: i64) {
+        if self.ch.play.is_some() {
+            return self.chan_flip(step); // a box channel: next / previous change channel
+        }
         let mut qi = self.qi as i64 + step;
         let chan = self.now.as_ref().map(|n| n.chan).unwrap_or(false);
         if chan && !self.queue.is_empty() {
@@ -1518,7 +1529,7 @@ impl Player {
             // navigation for the on-TV app (Jellyfin apps and Home Assistant send these through the server)
             // while something plays the on-TV app is closed (the player has the screen), so the d-pad keys would go
             // nowhere: Back / Home stop playback (the app comes back where you were), OK pauses and resumes
-            "GeneralCommand" if self.now.is_some()
+            "GeneralCommand" if (self.now.is_some() || self.ch.play.is_some())
                 && matches!(data["Name"].as_str(), Some("Back" | "GoHome" | "Select" | "MoveUp" | "MoveDown" | "MoveLeft" | "MoveRight")) =>
             {
                 self.remote_key(data["Name"].as_str().unwrap_or(""))
@@ -1563,7 +1574,7 @@ impl Player {
         if t.is_empty() {
             return;
         }
-        if self.now.is_some() {
+        if self.now.is_some() || self.ch.play.is_some() {
             return log(&format!("search \"{t}\": ignored, something is playing"));
         }
         log(&format!("search \"{t}\""));
@@ -1587,7 +1598,13 @@ impl Player {
                     self.command("Playstate", &json!({"Command": name}));
                 }
                 local::Cmd::Search(t) => self.search_text(&t),
+                local::Cmd::Channel(n) => self.play_channel(n),
             }
+        }
+        self.chan_house();
+        if self.ch.play.is_some() {
+            // a box channel: its own lines (item N start / end, queue empty) drive it, not the film/episode code below
+            return self.chan_tick();
         }
         while let Ok(f) = self.sub_rx.try_recv() {
             match f.result {
@@ -1878,7 +1895,7 @@ fn main() {
         cfg, api: Api::new(cfg), standby: None, settle: false, queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
         asked_audio: None, lang: cfg.audio_lang.clone(), asked_sub: None, sub_pref: SubPref::Default, cmds, sub_tx, sub_rx, shared,
         card: None, seek_to: None, sleep_at: None, auto_eps: 0, no_next: false, next_label: None,
-        volume: cfg.volume, muted: false,
+        volume: cfg.volume, muted: false, ch: chanplay::Chans::new(),
     };
     let mut wait = 2;
     loop {

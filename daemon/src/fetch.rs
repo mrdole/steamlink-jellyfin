@@ -1,5 +1,4 @@
 //! Cache fetcher: downloads upcoming items to the stick, and serves them (growing) over /cache.
-#![allow(dead_code)] // not called from main until the channel engine lands
 use crate::{UA, log};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};

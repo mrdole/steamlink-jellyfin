@@ -38,7 +38,7 @@ and a movie is its own show. A collection and a playlist with the same channel n
 | `show_server_live_tv` | `false` | Also list the server's own Live TV channels |
 | `schedule_day_start` | `"06:00"` | Local time the schedule day starts (`HH:MM`); anything else falls back to 06:00 and is logged |
 | `pad` | auto | `true`/`false` forces padding of each slot to the half hour on/off; absent = pad when the channel has Bumpers/Commercials |
-| `breaks` | `"between"` | `"between"` plays filler between programmes; `"off"` plays none. Anything else = `"between"` |
+| `breaks` | `"between"` | `"between"`: a commercial break (up to `break_minutes`) after each programme; `"off"`: no commercials (a padded slot is filled with bumpers only, or the "Up next" card). Anything else = `"between"` |
 | `break_minutes` | `2` | Length of a break in minutes, 0-10 |
 | `cache_gb` | auto | Disk the Link may use to cache upcoming programmes, in GB; absent or `0` = chosen from free space |
 | `fetch_rate` | `2.0` | How many times faster than real time upcoming programmes are fetched, 1-8 |
