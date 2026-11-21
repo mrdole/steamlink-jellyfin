@@ -65,6 +65,7 @@
 #include <pthread.h>
 #include "sljf-static.h"
 #include "live-buf.h"
+#include "item.h"
 
 #define AUDIO_RATE 48000
 #define AUDIO_CH 2
@@ -78,8 +79,6 @@
 #if AUDIO_CHUNK_BYTES != STATIC_AUDIO_CHUNK_BYTES
 #error "the static's audio stream is handed to the player: same chunk size"
 #endif
-
-#define FIFO_MAX 4096            /* read-ahead packets (~25 s of 25 fps video + audio) */
 
 int subs_init(CSLVideoContext *vctx);    /* sljf-subs.c */
 void subs_update(double t);
@@ -112,59 +111,79 @@ static void apply_gain(uint8_t *pcm, int bytes) {
    With a prebuffer a reader thread fills it, so a slow read never holds up feeding: Live TV at the live edge waits in
    av_read_frame for the network, and at times the server sends in bursts (Cartoon Network 2026-11-20: every read
    waited 230-490 ms, twice 2.9 s, for 3 min); when that wait was in the feeding loop both decoders ran dry with 3.8 s
-   of packets in this FIFO (stutter, 60 sync corrections). Without a prebuffer (files) the loop reads inline. */
-static AVPacket *fifo[FIFO_MAX]; static double fifo_ts[FIFO_MAX];
-static int fifo_head, fifo_n;
-static double last_ts, read_max;                      /* newest packet's stream time; longest read since the status */
-static AVFormatContext *g_fmt; static double g_ahead;   /* the reader stops while this much is read ahead */
-static int rd_eof, rd_err;                            /* the reader thread saw the end / a stream error */
-static volatile sig_atomic_t rd_quit;
+   of packets in this FIFO (stutter, 60 sync corrections). Without a prebuffer (files) the loop reads inline.
+   The FIFO and the reader belong to the item (item.h); the lock and the wake-up are shared. */
+static double read_max;                               /* longest read since the status */
+static double g_ahead;                                /* the reader stops while this much is read ahead */
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 
 static double now_s(void);
-static int interrupt_cb(void *o) { (void)o; return g_stop || rd_quit; }   /* lets a blocked read end on stop */
+static int interrupt_cb(void *o) { struct item *it = o; return g_stop || (it && it->rd_quit); }   /* lets a blocked read end on stop */
 
-static double fifo_span(void) { return fifo_n ? last_ts - fifo_ts[fifo_head] : 0; }
+static double fifo_span(struct item *it) { return it->fifo_n ? it->last_ts - it->fifo_ts[it->fifo_head] : 0; }
 
 /* one packet into the FIFO (q_mu held) */
-static void fifo_push(AVPacket *pkt) {
+static void fifo_push(struct item *it, AVPacket *pkt) {
     int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
-    if (ts != AV_NOPTS_VALUE) last_ts = ts * av_q2d(g_fmt->streams[pkt->stream_index]->time_base);
+    if (ts != AV_NOPTS_VALUE) it->last_ts = ts * av_q2d(it->fmt->streams[pkt->stream_index]->time_base);
     AVPacket *q = av_packet_alloc();
     av_packet_move_ref(q, pkt);
-    int at = (fifo_head + fifo_n) % FIFO_MAX;
-    fifo[at] = q; fifo_ts[at] = last_ts; fifo_n++;
+    int at = (it->fifo_head + it->fifo_n) % FIFO_MAX;
+    it->fifo[at] = q; it->fifo_ts[at] = it->last_ts; it->fifo_n++;
 }
 
 static void *reader(void *o) {
-    (void)o;
+    struct item *it = o;
     AVPacket *pkt = av_packet_alloc();
     for (;;) {
         pthread_mutex_lock(&q_mu);
-        while (!rd_quit && !g_stop && (fifo_n >= FIFO_MAX || fifo_span() >= g_ahead)) {
+        while (!it->rd_quit && !g_stop && (it->fifo_n >= FIFO_MAX || fifo_span(it) >= g_ahead)) {
             struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 100000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&q_cv, &q_mu, &ts);
         }
-        int quit = rd_quit || g_stop;
+        int quit = it->rd_quit || g_stop;
         pthread_mutex_unlock(&q_mu);
         if (quit) break;
         double r0 = now_s();
-        int err = av_read_frame(g_fmt, pkt);
+        int err = av_read_frame(it->fmt, pkt);
         double w = now_s() - r0;
         pthread_mutex_lock(&q_mu);
         if (w > read_max) read_max = w;
         if (err < 0) {
-            if (err == AVERROR_EOF) rd_eof = 1; else rd_err = err;
+            if (err == AVERROR_EOF) it->rd_eof = 1; else it->rd_err = err;
             pthread_mutex_unlock(&q_mu);
             break;
         }
-        fifo_push(pkt);
+        fifo_push(it, pkt);
         pthread_mutex_unlock(&q_mu);
     }
     av_packet_free(&pkt);
     return NULL;
+}
+
+int item_open(struct item *it, const char *url, AVDictionary *opts) {
+    memset(it, 0, sizeof *it);
+    it->vi = it->ai = -1;
+    it->fmt = avformat_alloc_context();
+    it->fmt->interrupt_callback.callback = interrupt_cb;   /* copied into the connection at open: set it first */
+    it->fmt->interrupt_callback.opaque = it;
+    int err = avformat_open_input(&it->fmt, url, NULL, &opts);
+    if (err < 0) { fprintf(stderr, "open failed: %s\n", av_err2str(err)); return err; }   /* (fmt is freed by the failed open) */
+    if ((err = avformat_find_stream_info(it->fmt, NULL)) < 0) { fprintf(stderr, "no stream info: %s\n", av_err2str(err)); return err; }
+    return 0;
+}
+
+void item_close(struct item *it) {
+    if (it->threaded) {                               /* the interrupt callback ends a read in progress */
+        pthread_mutex_lock(&q_mu); it->rd_quit = 1; pthread_cond_signal(&q_cv); pthread_mutex_unlock(&q_mu);
+        pthread_join(it->rd_th, NULL);
+        it->threaded = 0;
+    }
+    while (it->fifo_n) { av_packet_free(&it->fifo[it->fifo_head]); it->fifo_head = (it->fifo_head + 1) % FIFO_MAX; it->fifo_n--; }
+    swr_free(&it->swr); avcodec_free_context(&it->adec); av_bsf_free(&it->bsf);
+    avformat_close_input(&it->fmt);
 }
 
 static double now_s(void) {
@@ -255,26 +274,23 @@ int main(int argc, char **argv) {
     /* no "reconnect": Jellyfin's stream cannot be resumed by byte offset. On a dropped connection sljf-play exits
        with code 3 and sljfd starts it again at the last position. */
 
-    AVFormatContext *fmt = avformat_alloc_context();
-    fmt->interrupt_callback.callback = interrupt_cb;   /* copied into the connection at open: set it first */
+    struct item cur;
     double t0 = now_s();
     static_background(1);                               /* the static keeps moving while these block */
-    int err = avformat_open_input(&fmt, url, NULL, &opts);
-    int serr = err < 0 ? 0 : avformat_find_stream_info(fmt, NULL);
+    int err = item_open(&cur, url, opts);
     static_background(0);
     av_dict_free(&opts);
-    if (err < 0) { fprintf(stderr, "open failed: %s\n", av_err2str(err)); return g_stop && svol >= 0 ? 0 : 1; }
-    if ((err = serr) < 0) { fprintf(stderr, "no stream info: %s\n", av_err2str(err)); return g_stop && svol >= 0 ? 0 : 1; }
-    printf("opened in %.1f s, format %s\n", now_s() - t0, fmt->iformat->name);
+    if (err < 0) return g_stop && svol >= 0 ? 0 : 1;
+    printf("opened in %.1f s, format %s\n", now_s() - t0, cur.fmt->iformat->name);
 
-    int vi = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    int ai = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    if (vi < 0) { fprintf(stderr, "no video stream\n"); return 1; }
+    cur.vi = av_find_best_stream(cur.fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    cur.ai = av_find_best_stream(cur.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (cur.vi < 0) { fprintf(stderr, "no video stream\n"); return 1; }
     /* Jellyfin's audio can start late in the stream (it converts audio while copying video), so probing may see an
        audio stream without parameters and av_find_best_stream skips it: take it anyway, the decoder works them out. */
-    for (unsigned i = 0; ai < 0 && i < fmt->nb_streams; i++)
-        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ai = (int)i;
-    AVStream *vs = fmt->streams[vi];
+    for (unsigned i = 0; cur.ai < 0 && i < cur.fmt->nb_streams; i++)
+        if (cur.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) cur.ai = (int)i;
+    AVStream *vs = cur.fmt->streams[cur.vi];
     if (vs->codecpar->codec_id != AV_CODEC_ID_H264) {
         fprintf(stderr, "video is %s, the Steam Link decoder only takes h264\n", avcodec_get_name(vs->codecpar->codec_id));
         return 1;
@@ -283,13 +299,12 @@ int main(int argc, char **argv) {
            vs->codecpar->profile, av_q2d(vs->avg_frame_rate));
 
     /* MP4/MKV carry length-prefixed NALs: convert to Annex-B (MPEG-TS already is). */
-    AVBSFContext *bsf = NULL;
-    if (vs->codecpar->extradata_size && vs->codecpar->extradata[0] == 1) {
+        if (vs->codecpar->extradata_size && vs->codecpar->extradata[0] == 1) {
         const AVBitStreamFilter *f = av_bsf_get_by_name("h264_mp4toannexb");
-        av_bsf_alloc(f, &bsf);
-        avcodec_parameters_copy(bsf->par_in, vs->codecpar);
-        bsf->time_base_in = vs->time_base;
-        av_bsf_init(bsf);
+        av_bsf_alloc(f, &cur.bsf);
+        avcodec_parameters_copy(cur.bsf->par_in, vs->codecpar);
+        cur.bsf->time_base_in = vs->time_base;
+        av_bsf_init(cur.bsf);
         printf("converting to Annex-B\n");
     }
 
@@ -303,20 +318,19 @@ int main(int argc, char **argv) {
     SLVideo_SetStreamVideoTransferMatrix(vstr, k_ESLVideoTransferMatrix_Automatic);
     AVRational fr = vs->avg_frame_rate.num ? vs->avg_frame_rate : vs->r_frame_rate;
     if (fr.num) SLVideo_SetStreamTargetFramerate(vstr, fr.num, fr.den);
-    if (fmt->bit_rate > 0) SLVideo_SetStreamTargetBitrate(vstr, (int)(fmt->bit_rate / 1000));
+    if (cur.fmt->bit_rate > 0) SLVideo_SetStreamTargetBitrate(vstr, (int)(cur.fmt->bit_rate / 1000));
     int subs = subs_init(vctx) == 0;
     double start_s = getenv("SLJF_START") ? atof(getenv("SLJF_START")) : 0;
 
-    AVCodecContext *adec = NULL; SwrContext *swr = NULL;
-    CSLAudioContext *actx = NULL; CSLAudioStream *astr = NULL;
-    if (ai >= 0) {
-        AVStream *as = fmt->streams[ai];
+        CSLAudioContext *actx = NULL; CSLAudioStream *astr = NULL;
+    if (cur.ai >= 0) {
+        AVStream *as = cur.fmt->streams[cur.ai];
         const AVCodec *c = avcodec_find_decoder(as->codecpar->codec_id);
-        if (!c) { fprintf(stderr, "no decoder for audio %s, playing without sound\n", avcodec_get_name(as->codecpar->codec_id)); ai = -1; }
+        if (!c) { fprintf(stderr, "no decoder for audio %s, playing without sound\n", avcodec_get_name(as->codecpar->codec_id)); cur.ai = -1; }
         else {
-            adec = avcodec_alloc_context3(c);
-            avcodec_parameters_to_context(adec, as->codecpar);
-            if (avcodec_open2(adec, c, NULL) < 0) { fprintf(stderr, "audio decoder open failed\n"); return 1; }
+            cur.adec = avcodec_alloc_context3(c);
+            avcodec_parameters_to_context(cur.adec, as->codecpar);
+            if (avcodec_open2(cur.adec, c, NULL) < 0) { fprintf(stderr, "audio decoder open failed\n"); return 1; }
             static_give_audio(&actx, &astr);          /* the static's own stream, if it made one: no second stream */
             if (!astr) {
                 actx = SLAudio_CreateContext();
@@ -347,10 +361,9 @@ int main(int argc, char **argv) {
     int started = 0, low_logged = 0;
     double prebuf = getenv("SLJF_PREBUFFER_MS") ? atof(getenv("SLJF_PREBUFFER_MS")) / 1000.0 : 0;
     double fifo_low = 1e9;                            /* smallest read-ahead since the last status line */
-    g_fmt = fmt; g_ahead = livebuf_ahead(prebuf);
-    pthread_t rd_th; int threaded = 0;
-    if (prebuf > 0) {
-        if (pthread_create(&rd_th, NULL, reader, NULL) == 0) threaded = 1;
+    g_ahead = livebuf_ahead(prebuf);
+        if (prebuf > 0) {
+        if (pthread_create(&cur.rd_th, NULL, reader, &cur) == 0) cur.threaded = 1;
         else printf("reader thread failed, reading inline\n");
     }
     double sync_sum = 0, sync_last = 0, sync_fix_t = 0; int sync_n = 0, sync_fixes = 0;
@@ -395,7 +408,7 @@ int main(int argc, char **argv) {
         /* subtitle clock: the estimate above moves in steps (the decoder's queued-ms is coarse, up to ~1.5 s off), so
            run a steady clock on wall time, pulled gently towards the estimate and never backwards (cues would flicker
            at their edges); jump only when it is more than 1 s off (a stall) */
-        if (subs && shown >= 0 && (a_first >= 0 || ai < 0) && vfed - vq / 1000.0 > 0.5) {
+        if (subs && shown >= 0 && (a_first >= 0 || cur.ai < 0) && vfed - vq / 1000.0 > 0.5) {
             double est = start_s + shown - zero;
             double run = sub_clock + (t - sub_wall);
             if (sub_clock < 0 || run - est > 1.0 || est - run > 1.0) sub_clock = est;
@@ -404,7 +417,7 @@ int main(int argc, char **argv) {
             subs_update(sub_clock);
         }
         read_ctl();
-        osd_tick(shown >= 0 && (a_first >= 0 || ai < 0) ? start_s + shown - zero : start_s);
+        osd_tick(shown >= 0 && (a_first >= 0 || cur.ai < 0) ? start_s + shown - zero : start_s);
         if (t - last >= 1.0) {
             int sw = 0, sh = 0; SLVideo_GetStreamResolution(vstr, &sw, &sh);
             if (sync_n) sync_last = sync_sum / sync_n;
@@ -415,13 +428,13 @@ int main(int argc, char **argv) {
             pthread_mutex_lock(&q_mu);
             if (prebuf > 0) {
                 double hv = -1, ha = -1;              /* stream time of the next video / audio packet to feed */
-                for (int i = 0; i < fifo_n && (hv < 0 || ha < 0); i++) {
-                    int k = (fifo_head + i) % FIFO_MAX;
-                    if (fifo[k]->stream_index == vi && hv < 0) hv = fifo_ts[k];
-                    else if (fifo[k]->stream_index == ai && ha < 0) ha = fifo_ts[k];
+                for (int i = 0; i < cur.fifo_n && (hv < 0 || ha < 0); i++) {
+                    int k = (cur.fifo_head + i) % FIFO_MAX;
+                    if (cur.fifo[k]->stream_index == cur.vi && hv < 0) hv = cur.fifo_ts[k];
+                    else if (cur.fifo[k]->stream_index == cur.ai && ha < 0) ha = cur.fifo_ts[k];
                 }
-                printf(" | ahead %.1f s (low %.1f) v %.1f a %.1f pk %d", fifo_n ? last_ts - fifo_ts[fifo_head] : 0,
-                       fifo_low > 1e8 ? 0 : fifo_low, hv < 0 ? 0 : last_ts - hv, ha < 0 ? 0 : last_ts - ha, fifo_n);
+                printf(" | ahead %.1f s (low %.1f) v %.1f a %.1f pk %d", cur.fifo_n ? cur.last_ts - cur.fifo_ts[cur.fifo_head] : 0,
+                       fifo_low > 1e8 ? 0 : fifo_low, hv < 0 ? 0 : cur.last_ts - hv, ha < 0 ? 0 : cur.last_ts - ha, cur.fifo_n);
             }
             printf(" | read max %.0f ms\n", read_max * 1000);
             fifo_low = 1e9; read_max = 0;
@@ -441,11 +454,11 @@ int main(int argc, char **argv) {
             sync_sum = 0; sync_n = 0;
         }
         pthread_mutex_lock(&q_mu);
-        if (threaded) {                               /* the reader thread's end / error, once the FIFO is empty */
-            if (rd_err && !fifo_n) { err = rd_err; pthread_mutex_unlock(&q_mu); printf("stream error: %s\n", av_err2str(err)); rc = 3; break; }
-            if (rd_eof && !eof) { printf("end of stream\n"); eof = 1; }
+        if (cur.threaded) {                               /* the reader thread's end / error, once the FIFO is empty */
+            if (cur.rd_err && !cur.fifo_n) { err = cur.rd_err; pthread_mutex_unlock(&q_mu); printf("stream error: %s\n", av_err2str(err)); rc = 3; break; }
+            if (cur.rd_eof && !eof) { printf("end of stream\n"); eof = 1; }
         }
-        int n_now = fifo_n;
+        int n_now = cur.fifo_n;
         pthread_mutex_unlock(&q_mu);
         /* end of stream: wait for the decoders to play out what they hold. The video queue does not always reach 0
            (a re-encoded episode sat at its last frame for 20 min, 2026-11-20), so also stop once it has had the time
@@ -458,36 +471,36 @@ int main(int argc, char **argv) {
         /* back-pressure: both decoders hold about AHEAD_MS; no room while both are full */
         int room = !(vq > AHEAD_MS && (!astr || aq > AHEAD_MS));
         /* inline read (no prebuffer): one packet when the decoders have room */
-        int want_read = !threaded && !eof && fifo_n < FIFO_MAX && (prebuf > 0 ? fifo_span() < g_ahead : (!fifo_n && room));
+        int want_read = !cur.threaded && !eof && cur.fifo_n < FIFO_MAX && (prebuf > 0 ? fifo_span(&cur) < g_ahead : (!cur.fifo_n && room));
         if (want_read) {
             double r0 = now_s();
-            err = av_read_frame(fmt, pkt);
+            err = av_read_frame(cur.fmt, pkt);
             if (now_s() - r0 > read_max) read_max = now_s() - r0;
             if (err == AVERROR_EOF) { printf("end of stream\n"); eof = 1; continue; }
             if (err < 0) { printf("stream error: %s\n", av_err2str(err)); rc = 3; break; }
-            fifo_push(pkt);
+            fifo_push(&cur, pkt);
         }
         pthread_mutex_lock(&q_mu);
-        double span = fifo_span();
+        double span = fifo_span(&cur);
         if (!started) {
-            if (span >= prebuf || eof || fifo_n == FIFO_MAX) {
+            if (span >= prebuf || eof || cur.fifo_n == FIFO_MAX) {
                 started = 1;
                 if (prebuf > 0) printf("prebuffered %.1f s in %.1f s\n", span, now_s() - start);
-            } else { pthread_mutex_unlock(&q_mu); if (threaded) usleep(5000); continue; }
+            } else { pthread_mutex_unlock(&q_mu); if (cur.threaded) usleep(5000); continue; }
         }
-        if (prebuf > 0 && fifo_n) {
+        if (prebuf > 0 && cur.fifo_n) {
             if (span < fifo_low) fifo_low = span;
             if (span < 0.2 && !low_logged) { printf("read-ahead ran out (network slower than real time)\n"); low_logged = 1; }
             if (span > 1.0) low_logged = 0;
         }
-        if (!room || !fifo_n) { pthread_mutex_unlock(&q_mu); if (!want_read) usleep(5000); continue; }
-        av_packet_move_ref(pkt, fifo[fifo_head]);
-        av_packet_free(&fifo[fifo_head]);
-        fifo_head = (fifo_head + 1) % FIFO_MAX; fifo_n--;
+        if (!room || !cur.fifo_n) { pthread_mutex_unlock(&q_mu); if (!want_read) usleep(5000); continue; }
+        av_packet_move_ref(pkt, cur.fifo[cur.fifo_head]);
+        av_packet_free(&cur.fifo[cur.fifo_head]);
+        cur.fifo_head = (cur.fifo_head + 1) % FIFO_MAX; cur.fifo_n--;
         pthread_cond_signal(&q_cv);
         pthread_mutex_unlock(&q_mu);
 
-        if (pkt->stream_index == vi) {
+        if (pkt->stream_index == cur.vi) {
             AVPacket *p = pkt;
             if (v_first < 0 && pkt->pts != AV_NOPTS_VALUE) v_first = pkt->pts * av_q2d(vs->time_base) - vframes * fdur;
             if (pkt->dts != AV_NOPTS_VALUE) {                /* measure the real frame rate (see fdur above) */
@@ -507,9 +520,9 @@ int main(int argc, char **argv) {
                 }
                 dts_ring[dts_n++] = d;
             }
-            if (bsf) {
-                av_bsf_send_packet(bsf, pkt);
-                while (av_bsf_receive_packet(bsf, fpkt) == 0) {
+            if (cur.bsf) {
+                av_bsf_send_packet(cur.bsf, pkt);
+                while (av_bsf_receive_packet(cur.bsf, fpkt) == 0) {
                     if (SLVideo_BeginFrame(vstr, fpkt->size) || SLVideo_WriteFrameData(vstr, fpkt->data, fpkt->size)
                         || SLVideo_SubmitFrame(vstr)) vfail++; else vframes++;
                     av_packet_unref(fpkt);
@@ -520,24 +533,24 @@ int main(int argc, char **argv) {
                 if (SLVideo_BeginFrame(vstr, p->size) || SLVideo_WriteFrameData(vstr, p->data, p->size)
                     || SLVideo_SubmitFrame(vstr)) vfail++; else vframes++;
             }
-        } else if (pkt->stream_index == ai && adec) {
+        } else if (pkt->stream_index == cur.ai && cur.adec) {
             apk++;
-            if (a_first < 0 && pkt->pts != AV_NOPTS_VALUE) a_first = pkt->pts * av_q2d(fmt->streams[ai]->time_base);
-            if (avcodec_send_packet(adec, pkt) == 0) {
-                while (avcodec_receive_frame(adec, afr) == 0) {
-                    if (!swr) {                       /* set up from the first decoded frame */
+            if (a_first < 0 && pkt->pts != AV_NOPTS_VALUE) a_first = pkt->pts * av_q2d(cur.fmt->streams[cur.ai]->time_base);
+            if (avcodec_send_packet(cur.adec, pkt) == 0) {
+                while (avcodec_receive_frame(cur.adec, afr) == 0) {
+                    if (!cur.swr) {                       /* set up from the first decoded frame */
                         AVChannelLayout out = AV_CHANNEL_LAYOUT_STEREO;
-                        swr_alloc_set_opts2(&swr, &out, AV_SAMPLE_FMT_S16, AUDIO_RATE,
+                        swr_alloc_set_opts2(&cur.swr, &out, AV_SAMPLE_FMT_S16, AUDIO_RATE,
                                             &afr->ch_layout, afr->format, afr->sample_rate, 0, NULL);
-                        if (!swr || swr_init(swr) < 0) { fprintf(stderr, "resampler init failed\n"); return 1; }
+                        if (!cur.swr || swr_init(cur.swr) < 0) { fprintf(stderr, "resampler init failed\n"); return 1; }
                         printf("audio started: %d ch %d Hz\n", afr->ch_layout.nb_channels, afr->sample_rate);
                     }
                     int room = (int)(sizeof abuf - afill) / (AUDIO_CH * 2);
                     uint8_t *outp = abuf + afill;
-                    int n = swr_convert(swr, &outp, room, (const uint8_t **)afr->extended_data, afr->nb_samples);
+                    int n = swr_convert(cur.swr, &outp, room, (const uint8_t **)afr->extended_data, afr->nb_samples);
                     if (n > 0) afill += n * AUDIO_CH * 2;
                     if (afr->pts != AV_NOPTS_VALUE)
-                        a_end = afr->pts * av_q2d(fmt->streams[ai]->time_base) + afr->nb_samples / (double)afr->sample_rate;
+                        a_end = afr->pts * av_q2d(cur.fmt->streams[cur.ai]->time_base) + afr->nb_samples / (double)afr->sample_rate;
                     if (adrop > 0) {
                         int k = adrop < afill ? (int)adrop : afill;
                         afill -= k; adrop -= k; memmove(abuf, abuf + k, afill);
@@ -558,11 +571,7 @@ int main(int argc, char **argv) {
         av_packet_unref(pkt);
     }
 
-    if (threaded) {                                   /* the interrupt callback ends a read in progress */
-        pthread_mutex_lock(&q_mu); rd_quit = 1; pthread_cond_signal(&q_cv); pthread_mutex_unlock(&q_mu);
-        pthread_join(rd_th, NULL);
-    }
-    while (fifo_n) { av_packet_free(&fifo[fifo_head]); fifo_head = (fifo_head + 1) % FIFO_MAX; fifo_n--; }
+    item_close(&cur);                                 /* the reader thread (the interrupt callback ends a read in progress), the FIFO, the demuxer, filter and decoder */
     printf("stopped after %.1f s: %ld video frames (%ld failed), %ld audio packets\n",
            now_s() - start, vframes, vfail, apk);
     static_free();                                    /* before the contexts go; the shared stream is ours now */
@@ -571,8 +580,6 @@ int main(int argc, char **argv) {
     if (actx) SLAudio_FreeContext(actx);
     if (vstr) SLVideo_FreeStream(vstr);
     SLVideo_FreeContext(vctx);
-    swr_free(&swr); avcodec_free_context(&adec); av_bsf_free(&bsf);
     av_frame_free(&afr); av_packet_free(&pkt); av_packet_free(&fpkt);
-    avformat_close_input(&fmt);
     return rc;
 }
