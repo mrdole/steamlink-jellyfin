@@ -31,6 +31,12 @@ Collections or playlists on the Jellyfin server named `Channel 10 Classic Sitcom
 suit a Link account that may not create collections: episodes in a playlist are grouped into one show per series,
 and a movie is its own show. A collection and a playlist with the same channel number: the lower id wins.
 
+The day's lineup is read once per schedule day (at `schedule_day_start`) and kept for the day: a new or renamed
+channel collection/playlist, or a changed `channel_prefix`, shows up at the next schedule day start. Episodes added
+to an existing channel follow the same rule. A restart of sljfd alone keeps today's saved lineup
+(`/mnt/scratch/sljf/cache/channels.json`); to pick a change up at once, delete that file and restart sljfd
+(`/etc/init.d/startup/S98sljfd restart`).
+
 | Key | Default | What |
 |---|---|---|
 | `channels` | `true` | Build channels from the server's collections |
