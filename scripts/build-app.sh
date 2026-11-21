@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the on-TV Jellyfin app for the Steam Link.   scripts/build-app.sh  ->  out/app/jellyfin/
-#   sljf-ui (Qt 5.14 Quick host, SDK qmake), main.qml, theme.js (from themes/<theme>.yaml, THEME=name),
+#   sljf-ui (Qt 5.14 Quick host, SDK qmake), main.qml + Guide.qml + guide.js, theme.js (from themes/<theme>.yaml, THEME=name),
 #   fonts (the theme's font, copied from this machine), toc.txt + icon.png (the tile), run.sh.
 # Install on the Link: scripts/deploy.sh (copies it to /home/apps/jellyfin).
 set -euo pipefail
@@ -29,7 +29,7 @@ done
   cd "$B" && qmake "$HERE/app/app.pro" >/dev/null && make -j"$(nproc)" 2>&1 | grep -E "error|warning: unused" || true
   [ -f "$B/sljf-ui" ] || { echo "sljf-ui build failed"; exit 1; }
   "$STRIP" -o "$OUT/sljf-ui" "$B/sljf-ui" )
-cp "$HERE/app/main.qml" "$HERE/app/toc.txt" "$HERE/app/run.sh" "$OUT/"
+cp "$HERE/app/main.qml" "$HERE/app/Guide.qml" "$HERE/app/guide.js" "$HERE/app/toc.txt" "$HERE/app/run.sh" "$OUT/"
 C() { python3 -c "import yaml,sys;print(yaml.safe_load(open(sys.argv[1]))['palette'][sys.argv[2]])" "$TFILE" "$1"; }
 magick -size 116x116 "xc:$(C card)" -fill "$(C accent)" -draw "rectangle 0,0 115,7" \
   -fill "$(C accent)" -draw "polygon 40,34 40,86 86,60" -fill "$(C fg)" -font "$OUT/fonts/$(ls "$OUT/fonts" | grep -i bold | head -1)" \

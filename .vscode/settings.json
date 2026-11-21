@@ -1,0 +1,4 @@
+{
+  "files.exclude": { "out": true, "daemon/target": true, "**/__pycache__": true },
+  "files.watcherExclude": { "**/out/**": true, "**/daemon/target/**": true, "**/__pycache__/**": true }
+}

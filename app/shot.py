@@ -7,14 +7,17 @@
 
 Loads out/app/jellyfin/main.qml (build-app.sh) at 1280x720 offscreen, sends the keys through main.qml's key(),
 waits 2.5 s after the last one and saves the picture. `call:FN` runs a function of the root item (e.g. call:loadHome),
-`search:TEXT` opens Search with that text typed.
+`search:TEXT` opens Search with that text typed, `js:CODE` evaluates CODE in main.qml's root (e.g. fake why
+playback ended: js:"wake({after: 'guide', channel: '<id>'})"; js:"woke = {screen: 'guide'}; wake({after: ''})").
+Careful: `select` on a channel or guide block calls the real /play and takes over the TV.
 """
 import os
 import sys
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt5.QtCore import QMetaObject, Q_ARG, QTimer, QUrl, QVariant  # noqa: E402
+os.environ["QT_QPA_PLATFORM"] = "offscreen"   # a desktop session sets wayland: the window would be tiled
+from PyQt5.QtCore import QMetaObject, Q_ARG, QTimer, QUrl, QVariant, qInstallMessageHandler  # noqa: E402
 from PyQt5.QtGui import QGuiApplication  # noqa: E402
+from PyQt5.QtQml import QQmlExpression  # noqa: E402
 from PyQt5.QtQuick import QQuickView  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +28,7 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     out, steps = sys.argv[1], sys.argv[2:]
+    qInstallMessageHandler(lambda kind, ctx, msg: print(msg, file=sys.stderr))   # console.log + QML warnings
     app = QGuiApplication(sys.argv[:1])
     v = QQuickView()
     v.setResizeMode(QQuickView.SizeRootObjectToView)
@@ -45,6 +49,13 @@ def main():
                 root.setProperty("term", text)
                 QMetaObject.invokeMethod(root, "search", Q_ARG(QVariant, ""), Q_ARG(QVariant, 0))
             QTimer.singleShot(t, typed)
+        elif s.startswith("js:"):
+            def run(code=s[3:]):
+                e = QQmlExpression(v.rootContext(), root, code)
+                e.evaluate()
+                if e.hasError():
+                    print("js:", e.error().toString(), file=sys.stderr)
+            QTimer.singleShot(t, run)
         elif s.startswith("call:"):
             QTimer.singleShot(t, lambda f=s[5:]: QMetaObject.invokeMethod(root, f))
         else:

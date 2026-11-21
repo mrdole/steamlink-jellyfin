@@ -56,6 +56,7 @@ static const char *g_path;
 static int g_ready;               /* cues loaded */
 static int g_draw;                /* font and overlays set up (1), failed (-1) */
 static time_t g_looked;
+static int g_suspended;           /* the static (sljf-static.c) owns the screen: draw nothing */
 
 static double srt_time(const char *s) {
     int h, m, sec, ms;
@@ -240,6 +241,7 @@ static double g_osd_dur;          /* item length in seconds (0 = live: no progre
 static double g_osd_pos = -1;     /* position to show instead of the playing one (seek target, paused) */
 static double g_item_t = -1;      /* the playing position (item seconds), from sljf-play */
 static long g_osd_drawn = -1;     /* second of the clock last drawn */
+static double g_osd_left;         /* while the static is up the bar's time stands still: seconds it still has */
 
 static int osd_visible(void) { return g_osd_until < 0 || (g_osd_until > 0 && wall() < g_osd_until); }
 
@@ -300,7 +302,7 @@ static int draw_init(void) {
 
 /* draw the strip: the bar (when showing) and the subtitle text above it */
 static void redraw(void) {
-    if (draw_init()) return;
+    if (g_suspended || !g_vctx || draw_init()) return;   /* !g_vctx: an osd line before subs_init (--static wait) */
     int osd = osd_visible();
     const char *t = g_cur ? g_cur : "";
     if (!*t && !osd) {
@@ -385,6 +387,7 @@ void osd_command(const char *line) {
     snprintf(g_osd_hint, sizeof g_osd_hint, "%s", n > 3 ? f[3] : "");
     g_osd_pos = n > 4 ? atof(f[4]) : -1;
     g_osd_until = secs < 0 ? -1 : secs > 0 ? wall() + secs : 0;
+    if (g_suspended) g_osd_left = secs > 0 ? secs : 0;   /* the channel banner sent while tuning: shown after it */
     redraw();
 }
 
@@ -392,10 +395,27 @@ void osd_command(const char *line) {
    moves to another second and hides it when its time is up */
 void osd_tick(double t) {
     if (t >= 0) g_item_t = t;
-    if (!g_osd_until) return;
+    if (!g_osd_until || g_suspended) return;
     if (!osd_visible()) { g_osd_until = 0; redraw(); return; }
     double pos = g_osd_pos >= 0 ? g_osd_pos : g_item_t;
     if ((long)pos != g_osd_drawn) redraw();
+}
+
+/* on = 1: hide the strip and draw nothing (the static is up; the Link shows one overlay at a time); on = 0: draw it
+   again as it is now (cues and the bar kept their state meanwhile; the bar's timer is paused, so the channel banner
+   sent while a channel tunes behind the static shows for its full time once the picture is up) */
+void subs_suspend(int on) {
+    if (on == g_suspended) return;
+    g_suspended = on;
+    if (on) {
+        g_osd_left = g_osd_until > 0 ? g_osd_until - wall() : 0;
+        if (g_osd_left < 0) g_osd_left = 0;
+        if (g_shown) { SLVideo_HideOverlay(g_ov[g_ovi]); g_shown = 0; }
+    } else {
+        if (g_osd_left > 0) g_osd_until = wall() + g_osd_left;   /* the bar gets the time it had left */
+        g_osd_left = 0;
+        if (g_draw > 0 || osd_visible()) redraw();
+    }
 }
 
 void subs_free(void) {

@@ -7,6 +7,24 @@ moves those lines into the new version's section.
 
 ## [Unreleased]
 
+### Added
+- Home screen: the on-TV app now starts on three big tiles, JELLYFIN (the Jellyfin home as before), LIVE TV (the
+  TV guide; left out when the server has no Live TV) and STEAM (back to the Link's own menu).
+- TV guide: channels down the side, the next two hours across, programme blocks with the focused programme's title,
+  time and description at the top. Up/Down move between channels, Left/Right through time, OK tunes the channel.
+  It opens on the channel last watched. New sljfd endpoint `GET /guide?hours=N`.
+- Live TV static: TV snow with a faint hiss for the whole wait while a channel tunes (including channel flips) and
+  whenever Live TV drops or rebuffers; it goes away with the first picture. Config `live_tv_static` (default `true`)
+  and `static_volume` (hiss loudness in percent, default `8`, `0` = silent). The hiss follows `volume` and Mute
+  like the programme sound.
+
+### Changed
+- Home (remote, keyboard, controller Start, Home Assistant `GoHome`) now goes to the home screen; during Live TV it
+  stops the channel and opens the TV guide on that channel. Back on the Jellyfin home goes to the home screen; Back
+  on the home screen does nothing (STEAM is the way out). Back during playback still returns to where you were.
+- Live TV no longer shows STARTING: the app gives up the screen at once and the channel tunes behind the static.
+  A flip during the wait cancels the tune and tunes the new channel.
+
 ## [0.1.0-alpha.4] - 2026-11-21
 
 ### Added

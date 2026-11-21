@@ -2,6 +2,9 @@
 // Look: the theme in themes/ (theme.js is generated from themes/<name>.yaml by build-app.sh).
 // Input: every source ends up in key(k) with k = up/down/left/right/select/back/home:
 //   keyboard and game controllers (main.cpp), and remote commands through Jellyfin or the LAN API (sljfd /events long poll).
+// Screens: "home" (tiles JELLYFIN / LIVE TV / STEAM, where the app starts), "jellyfin" (the Jellyfin home, pages,
+// search, play dialog), "guide" (the TV guide, Guide.qml). Home goes to "home" from everywhere; Back on "home" does
+// nothing (STEAM is the way to the Link's menu).
 import QtQuick 2.12
 import "theme.js" as T
 
@@ -13,6 +16,15 @@ Rectangle {
     property string api: "http://127.0.0.1:8097"
 
     // ---- state ----
+    // "" only while a --restore start waits for /events to say where to go (wake())
+    property string screen: typeof restoring !== "undefined" && restoring ? "" : "home"
+    property string tile: "JELLYFIN"                   // focused tile on the home screen
+    property bool hasLive: false                       // /home has Live TV channels: the LIVE TV tile shows
+    property var tiles: hasLive ? ["JELLYFIN", "LIVE TV", "STEAM"] : ["JELLYFIN", "STEAM"]
+    onTilesChanged: if (tiles.indexOf(tile) < 0) tile = "JELLYFIN"
+    property string guideFrom: "home"                  // where Back from the guide goes
+    property var lastChannel: null                     // /events.channel: the Live TV channel last watched
+    property var woke: null                            // the saved state read at a --restore start, for wake()
     property var rows: []                              // home: [{title, items}]
     property int hRow: 0
     property var hCols: []
@@ -40,6 +52,7 @@ Rectangle {
     // are fetched again so progress and watched marks are fresh.
     function saveState() {
         if (typeof store === "undefined") return           // qml-qt5 preview on the build machine
+        if (screen === "" && woke) { store.save(JSON.stringify(woke)); return }   // playing again before wake(): keep it
         var ids = {}
         for (var i = 0; i < rows.length; i++) {
             var it = rows[i].items[hCols[i] || 0]
@@ -50,16 +63,32 @@ Rectangle {
             var p = pages[i], cur = p.items[p.index]
             ps.push({title: p.title, parent: p.parent, index: p.index, id: cur ? cur.id : ""})
         }
-        console.log("state saved: depth " + depth + (depth ? " page " + pages[depth - 1].title + " #" + pages[depth - 1].index : " row " + hRow) + (searching ? " search " + term : ""))
-        store.save(JSON.stringify({row: rows[hRow] ? rows[hRow].title : "", rows: ids, pages: ps, searching: searching,
+        console.log("state saved: " + screen + (screen === "guide" ? " channel " + guide.focusId + " from " + guideFrom : "") + ", depth " + depth + (depth ? " page " + pages[depth - 1].title + " #" + pages[depth - 1].index : " row " + hRow) + (searching ? " search " + term : ""))
+        store.save(JSON.stringify({screen: screen || "home", guideFrom: guideFrom, gChannel: guide.focusId,
+                                   row: rows[hRow] ? rows[hRow].title : "", rows: ids, pages: ps, searching: searching,
                                    term: term, sZone: sZone, sKey: sKey, sRes: sRes, sId: results[sRes] ? results[sRes].id : ""}))
     }
-    function restoreState() {
+    function readState() {                              // --restore start: the rows' focus now, the rest in wake()
         if (typeof store === "undefined") return
         var v = null
         try { v = JSON.parse(store.load()) } catch (e) {}
         if (!v) return
-        saved = v
+        saved = v; woke = v
+    }
+    /// A --restore start, once /events is in: why playback ended decides where the app comes back (R1: only here,
+    /// `after` stays set until the next playback, so a normal start never reads it).
+    function wake(ev) {
+        var v = woke
+        woke = null
+        console.log("wake: after " + JSON.stringify(ev.after) + " channel " + ev.channel + " saved screen " + (v ? v.screen : "none"))
+        if (ev.after === "guide") { goHome(); openGuide(ev.channel, "home"); return }   // Home during Live TV
+        if (ev.after === "home" || !v) { goHome(); return }                              // Home during a film
+        if (v.screen === "guide") { openGuide(ev.channel || v.gChannel, v.guideFrom || "home"); return }
+        if (v.screen === "home") { goHome(); return }
+        restoreState(v)                                 // "jellyfin" (or a state file from before the home screen)
+    }
+    function restoreState(v) {
+        screen = "jellyfin"
         var ps = []
         for (var i = 0; i < v.pages.length; i++) {
             var q = v.pages[i]
@@ -100,6 +129,7 @@ Rectangle {
             if (d.resume.length) r.push({title: "CONTINUE WATCHING", items: d.resume})
             if (d.nextup.length) r.push({title: "NEXT UP", items: d.nextup})
             if (d.channels && d.channels.length) r.push({title: "LIVE TV", items: d.channels})
+            hasLive = !!(d.channels && d.channels.length)
             var libs = [{id: "", name: "SEARCH", type: "Search", folder: false}]
             for (var i = 0; i < d.libraries.length; i++)
                 if (d.libraries[i].name !== "Live TV") libs.push(d.libraries[i])
@@ -157,8 +187,8 @@ Rectangle {
         if (!it) return
         if (it.type === "Search") { searching = true; sZone = 0; return }
         if (it.folder) { openFolder(it); return }
+        if (it.type === "TvChannel") { tune(it.id); return }   // a channel just starts, no dialog
         detail = it; dBtn = 0; dOpts = []; dRow = 0
-        if (it.type === "TvChannel") { play(false); return }   // a channel just starts (the dialog says STARTING)
         get("/detail?id=" + it.id, function (v) {
             if (!v || detail !== it) return
             var o = []
@@ -198,6 +228,24 @@ Rectangle {
         })
     }
 
+    // Live TV: sljfd takes the screen at once (static while it tunes), so the app saves its state and leaves now
+    function tune(id) {
+        starting = true
+        startGiveUp.restart()
+        console.log("tune " + id + " from " + screen)
+        get("/play?id=" + id, function (v) {
+            if (!v) { starting = false; note = "COULD NOT START PLAYBACK"; return }
+            saveState(); Qt.exit(42)
+        })
+    }
+
+    function goHome() { detail = null; searching = false; depth = 0; screen = "home" }
+    function openGuide(channelId, from) {
+        if (screen !== "guide") guideFrom = from || (screen === "jellyfin" ? "jellyfin" : "home")
+        screen = "guide"
+        guide.open(channelId || lastChannel || "")
+    }
+
     function search(keepId, keepAt) {
         if (term.length < 2) { results = []; return }
         var t = term
@@ -224,7 +272,7 @@ Rectangle {
     property bool goWanted: false
     // text from the LAN API (e.g. a Home Assistant text box) or a Jellyfin app: Search with it typed, focus on the results
     function typedElsewhere(t) {
-        detail = null; starting = false; searching = true; depth = 0
+        detail = null; starting = false; searching = true; depth = 0; screen = "jellyfin"
         term = t.toUpperCase().replace(/[^A-Z0-9 ]/g, "")
         sKey = 39; sZone = 0; debounce.stop(); goWanted = true; search()
         console.log("search from outside: " + term)
@@ -233,8 +281,21 @@ Rectangle {
 
     // ---- input ----
     function key(k) {
-        if (starting) return
-        if (k === "home") { detail = null; searching = false; depth = 0; return }
+        if (starting || screen === "") return
+        if (k === "home") { goHome(); return }
+        if (screen === "home") {
+            var t = tiles.indexOf(tile)
+            if (t < 0) t = 0
+            if (k === "left") tile = tiles[Math.max(0, t - 1)]
+            else if (k === "right") tile = tiles[Math.min(tiles.length - 1, t + 1)]
+            else if (k === "select") {
+                if (tiles[t] === "JELLYFIN") { detail = null; searching = false; depth = 0; screen = "jellyfin" }
+                else if (tiles[t] === "LIVE TV") openGuide(lastChannel, "home")
+                else { console.log("steam: back to the Link's menu"); Qt.quit() }
+            }
+            return                                      // back: nothing (STEAM is the way out)
+        }
+        if (screen === "guide") { guide.key(k); return }
         if (detail) {
             var n = detail.resume ? 2 : 1
             if (k === "back") { detail = null; return }
@@ -285,8 +346,8 @@ Rectangle {
             if (i > p.items.length - 2 * per - 1) loadMore()
             return
         }
+        if (k === "back") { screen = "home"; return }
         if (!rows.length) return
-        if (k === "back") { Qt.quit(); return }
         var c = hCols[hRow] || 0
         if (k === "up") hRow = Math.max(0, hRow - 1)
         else if (k === "down") hRow = Math.min(rows.length - 1, hRow + 1)
@@ -300,8 +361,9 @@ Rectangle {
         var m = {}
         m[Qt.Key_Up] = "up"; m[Qt.Key_Down] = "down"; m[Qt.Key_Left] = "left"; m[Qt.Key_Right] = "right"
         m[Qt.Key_Return] = "select"; m[Qt.Key_Enter] = "select"; m[Qt.Key_Escape] = "back"; m[Qt.Key_Home] = "home"
-        if (searching && depth === 0 && !detail && event.key === Qt.Key_Backspace) { sType("DEL"); event.accepted = true; return }
-        if (searching && depth === 0 && !detail && event.text.length === 1 && /[a-zA-Z0-9 ]/.test(event.text)) {
+        var typing = screen === "jellyfin" && searching && depth === 0 && !detail
+        if (typing && event.key === Qt.Key_Backspace) { sType("DEL"); event.accepted = true; return }
+        if (typing && event.text.length === 1 && /[a-zA-Z0-9 ]/.test(event.text)) {
             sType(event.text === " " ? "SPACE" : event.text.toUpperCase()); event.accepted = true; return
         }
         if (m[event.key]) { key(m[event.key]); event.accepted = true }
@@ -310,10 +372,12 @@ Rectangle {
     // remote keys and "playback started" arrive here
     function poll() {
         get("/events?since=" + seq, function (v) {
-            if (!v) { pollRetry.start(); return }
+            if (!v) { if (screen === "") wake({after: "", channel: null}); pollRetry.start(); return }
             var first = seq === 0
             seq = v.seq
+            if (v.channel) lastChannel = v.channel
             if (v.playing) { saveState(); Qt.exit(42); return }
+            if (first && screen === "") wake(v)
             if (!first) for (var i = 0; i < v.keys.length; i++) key(v.keys[i])
             if (v.search) typedElsewhere(v.search)
             poll()
@@ -324,7 +388,7 @@ Rectangle {
     Timer { id: debounce; interval: 600; onTriggered: search() }
     // the daemon accepted the play but nothing started (item or channel failed to open): let the user go on
     Timer { id: startGiveUp; interval: 60000; onTriggered: if (starting) { starting = false; note = "COULD NOT START PLAYBACK" } }
-    Component.onCompleted: { if (typeof restoring !== "undefined" && restoring) restoreState(); loadHome(); poll() }
+    Component.onCompleted: { if (screen === "") readState(); loadHome(); poll() }
 
     // ---- pieces ----
     function img(it, w, wide) {
@@ -408,7 +472,8 @@ Rectangle {
         x: 40 * u; y: 26 * u; height: 40 * u; width: title.width + 28 * u; color: T.C.accent
         Text {
             id: title; anchors.centerIn: parent; color: T.C.on_accent
-            text: depth > 0 ? page.title.toUpperCase() : searching ? "SEARCH" : "JELLYFIN"
+            text: screen === "home" || screen === "" ? "STEAM LINK" : screen === "guide" ? "TV GUIDE"
+                  : depth > 0 ? page.title.toUpperCase() : searching ? "SEARCH" : "JELLYFIN"
             font.family: T.FONT; font.pixelSize: 22 * u; font.bold: true
         }
     }
@@ -422,7 +487,7 @@ Rectangle {
     // ---- home ----
     ListView {
         id: home
-        visible: depth === 0 && !searching
+        visible: screen === "jellyfin" && depth === 0 && !searching
         x: 32 * u; y: 86 * u; width: parent.width - 64 * u; height: parent.height - 126 * u
         clip: true; spacing: 6 * u; model: rows.length
         currentIndex: hRow; highlightMoveDuration: 150
@@ -457,7 +522,7 @@ Rectangle {
     // ---- browse ----
     GridView {
         id: grid
-        visible: depth > 0
+        visible: screen === "jellyfin" && depth > 0
         property bool wide: root.page ? root.page.wide : false
         property real pw: (wide ? 270 : 150) * u
         property int perRow: Math.max(1, Math.floor(width / cellWidth))
@@ -474,14 +539,14 @@ Rectangle {
         }
     }
     Text {
-        visible: depth > 0 && root.page && root.page.items.length === 0
+        visible: screen === "jellyfin" && depth > 0 && root.page && root.page.items.length === 0
         anchors.centerIn: parent; text: root.page && root.page.empty ? "NOTHING HERE" : "LOADING"
         color: T.C.dim; font.family: T.FONT; font.pixelSize: 22 * u
     }
 
     // ---- search ----
     Item {
-        visible: searching && depth === 0
+        visible: screen === "jellyfin" && searching && depth === 0
         x: 40 * u; y: 86 * u; width: parent.width - 80 * u; height: parent.height - 126 * u
         Rectangle {
             width: parent.width; height: 46 * u; color: T.C.raised; border.width: 2 * u; border.color: T.C.edge_hi
@@ -523,6 +588,73 @@ Rectangle {
                 Binding { target: item; property: "on"; value: sZone === 1 && sRes === index }
             }
         }
+    }
+
+    // ---- home screen: three big tiles ----
+    Row {
+        visible: screen === "home"
+        anchors.horizontalCenter: parent.horizontalCenter; y: 190 * u; spacing: 44 * u
+        Repeater {
+            model: root.tiles
+            Item {
+                id: tl
+                property bool on: root.tile === modelData
+                width: 330 * root.u; height: 300 * root.u
+                Rectangle {                                // hard offset shadow, as on the cards
+                    x: tl.on ? 8 * root.u : 0; y: tl.on ? 8 * root.u : 0; width: parent.width; height: parent.height
+                    color: T.C.shadow; visible: tl.on
+                }
+                Rectangle {
+                    width: parent.width; height: parent.height
+                    color: tl.on ? T.C.raised : T.C.card; border.width: (tl.on ? 4 : 1) * root.u
+                    border.color: tl.on ? T.C.accent : T.C.edge
+                    Canvas {                               // a simple drawn icon (no glyph fonts on the Link)
+                        id: icon
+                        property string kind: modelData
+                        property color ink: tl.on ? T.C.accent : T.C.dim
+                        onInkChanged: requestPaint()
+                        anchors.horizontalCenter: parent.horizontalCenter; y: 46 * root.u
+                        width: 120 * root.u; height: 100 * root.u
+                        onPaint: {
+                            var c = getContext("2d"), w = width, h = height
+                            c.reset(); c.fillStyle = ink; c.strokeStyle = ink; c.lineWidth = 7 * root.u; c.lineJoin = "round"
+                            if (kind === "JELLYFIN") {             // play
+                                c.beginPath(); c.moveTo(w * 0.3, h * 0.08); c.lineTo(w * 0.3, h * 0.92); c.lineTo(w * 0.78, h * 0.5)
+                                c.closePath(); c.fill()
+                            } else if (kind === "LIVE TV") {      // a TV set with rabbit ears
+                                c.beginPath(); c.moveTo(w * 0.32, h * 0.04); c.lineTo(w * 0.5, h * 0.26); c.lineTo(w * 0.68, h * 0.04); c.stroke()
+                                c.strokeRect(w * 0.08, h * 0.28, w * 0.84, h * 0.64)
+                                c.fillRect(w * 0.2, h * 0.4, w * 0.6, h * 0.4)
+                            } else {                              // leave: an arrow out of a box
+                                c.strokeRect(w * 0.12, h * 0.1, w * 0.48, h * 0.8)
+                                c.beginPath(); c.moveTo(w * 0.38, h * 0.5); c.lineTo(w * 0.9, h * 0.5); c.stroke()
+                                c.beginPath(); c.moveTo(w * 0.74, h * 0.3); c.lineTo(w * 0.92, h * 0.5); c.lineTo(w * 0.74, h * 0.7); c.stroke()
+                            }
+                        }
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter; y: 176 * root.u
+                        text: modelData; color: tl.on ? T.C.bright : T.C.fg
+                        font.family: T.FONT; font.pixelSize: 34 * root.u; font.bold: true
+                    }
+                    Text {
+                        anchors.horizontalCenter: parent.horizontalCenter; y: 228 * root.u
+                        text: modelData === "JELLYFIN" ? "FILMS AND SHOWS" : modelData === "LIVE TV" ? "TV GUIDE" : "BACK TO THE STEAM LINK"
+                        color: tl.on ? T.C.accent : T.C.dim; font.family: T.FONT; font.pixelSize: 15 * root.u; font.bold: true
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- TV guide ----
+    Guide {
+        id: guide
+        visible: screen === "guide"
+        u: root.u; api: root.api
+        x: 40 * u; y: 86 * u; width: parent.width - 80 * u; height: parent.height - 126 * u
+        onTune: root.tune(channelId)
+        onBack: { console.log("guide: back to " + root.guideFrom); root.screen = root.guideFrom }
     }
 
     // ---- play dialog ----
@@ -597,7 +729,11 @@ Rectangle {
     // ---- footer ----
     Text {
         x: 40 * u; anchors.bottom: parent.bottom; anchors.bottomMargin: 12 * u
-        text: note.length ? note : "ARROWS MOVE   OK SELECT   BACK " + (depth > 0 || searching || detail ? "BACK" : "EXIT")
-        color: note.length ? T.C.warn : T.C.dim; font.family: T.FONT; font.pixelSize: 13 * u
+        property string warn: screen === "guide" && guide.note.length ? guide.note : note
+        text: warn.length ? warn
+              : screen === "home" || screen === "" ? "ARROWS MOVE  OK SELECT"
+              : screen === "guide" ? "ARROWS MOVE   OK WATCH   BACK BACK   HOME HOME"
+              : "ARROWS MOVE   OK SELECT   BACK " + (depth > 0 || searching || detail ? "BACK" : "HOME")
+        color: warn.length ? T.C.warn : T.C.dim; font.family: T.FONT; font.pixelSize: 13 * u
     }
 }

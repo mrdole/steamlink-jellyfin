@@ -2,6 +2,8 @@
 //! internet itself, so the Link's old system TLS is not involved and the Jellyfin token stays in this process.
 //!
 //!   GET /home                      {resume:[..], nextup:[..], channels:[..], libraries:[..]}  (channels = Live TV)
+//!   GET /guide?hours=N             TV guide, N 1..6 (default 3): {now, channels:[{id, number, name, programs:[{id, name,
+//!                                  episode, start, end (epoch s), overview}]}]}, channels by number, empty programs allowed
 //!   GET /items?parent=ID&start=N   children of a library / series / season (60 per page)
 //!   GET /search?q=TEXT
 //!   GET /image?id=ID&w=300[&type=Primary|Backdrop|Thumb]     JPEG, cached in /mnt/scratch/sljf/cache
@@ -11,7 +13,8 @@
 //!                                  ones; audio/sub = stream index, sub=-1 off; the rest of the queue keeps the languages)
 //!   GET /control?cmd=pause|unpause|playpause|stop|next|prev|back10|fwd30
 //!   GET /key?k=up|down|left|right|select|back|home          inject a navigation key (tests)
-//!   GET /events?since=N            long poll (25 s): {seq, keys:[..], playing, paused, title, search}
+//!   GET /events?since=N            long poll (25 s): {seq, keys:[..], playing, paused, title, search,
+//!                                  after ("guide" | "home" | "": how playback last ended), channel (last Live TV id | null)}
 //!   GET /text?q=TEXT               open Search with TEXT typed (tests; other machines use the LAN port below)
 //!
 //! LAN API (optional, off unless config `lan_allow` lists addresses): port `lan_port` (default 8098), only from those
@@ -45,6 +48,11 @@ pub struct State {
     pub title: String,
     /// text to search for (seq it came with, when): from the LAN API or Jellyfin SendString
     pub search: Option<(u64, Instant, String)>,
+    /// how the last playback ended, for the app to come back to the right screen: "guide" (Home while watching
+    /// Live TV), "home" (Home during a film / episode), "" (anything else); cleared when playback starts
+    pub after: String,
+    /// the Live TV channel last played (item id)
+    pub channel: Option<String>,
 }
 
 #[derive(Default)]
@@ -78,6 +86,19 @@ impl Shared {
         s.search = Some((s.seq, Instant::now(), text.to_string()));
         self.cv.notify_all();
     }
+    /// Playback is about to stop for this reason ("home" | "guide" | ""); see State::after.
+    pub fn ended(&self, after: &str) {
+        let mut s = self.st.lock().unwrap();
+        s.after = after.to_string();
+        s.seq += 1;
+        self.cv.notify_all();
+    }
+    pub fn channel(&self, id: &str) {
+        let mut s = self.st.lock().unwrap();
+        s.channel = Some(id.to_string());
+        s.seq += 1;
+        self.cv.notify_all();
+    }
     pub fn playing(&self, playing: bool, paused: bool, title: &str) {
         let mut s = self.st.lock().unwrap();
         if s.playing != playing || s.paused != paused || s.title != title {
@@ -86,6 +107,7 @@ impl Shared {
             s.title = title.to_string();
             if playing {
                 s.search = None; // the app restarted after playback must not search again
+                s.after = String::new();
             }
             s.seq += 1;
             self.cv.notify_all();
@@ -149,6 +171,24 @@ fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &st
             "channels": list(api, &format!("/LiveTv/Channels?UserId={uid}&AddCurrentProgram=true&EnableImageTypes=Primary&ImageTypeLimit=1")),
             "libraries": list(api, &format!("/Users/{uid}/Views")),
         })),
+        "/guide" => {
+            let hours = query(q, "hours").and_then(|s| s.parse::<i64>().ok()).unwrap_or(3).clamp(1, 6);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let channels = match api.get(&format!("/LiveTv/Channels?UserId={uid}&EnableImageTypes=Primary&ImageTypeLimit=1")) {
+                Ok(v) => v,
+                Err(_) => return (502, "text/plain", b"jellyfin not answering".to_vec()),
+            };
+            // a failed programme query still gives the channel list (the app shows "No information")
+            let programs = api.get(&format!(
+                "/LiveTv/Programs?UserId={uid}&MinEndDate={}&MaxStartDate={}&SortBy=StartDate&Fields=Overview&EnableImageTypes=None&Limit=2000",
+                crate::guide::iso_utc(now), crate::guide::iso_utc(now + hours * 3600)
+            )).unwrap_or_else(|e| { log(&format!("local: {e}")); json!({"Items": []}) });
+            let returned = programs["Items"].as_array().map(|a| a.len()).unwrap_or(0);
+            if let Some(total) = programs["TotalRecordCount"].as_u64().filter(|t| *t > returned as u64) {
+                log(&format!("guide: programmes truncated ({returned} of {total})"));
+            }
+            ok(crate::guide::guide_json(&channels, &programs, now))
+        }
         "/items" => {
             let parent = safe(&query(q, "parent").unwrap_or_default());
             let start = safe(&query(q, "start").unwrap_or_default());
@@ -275,16 +315,22 @@ fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &st
             while s.seq <= since && Instant::now() < until {
                 s = sh.cv.wait_timeout(s, Duration::from_secs(1)).unwrap().0;
             }
-            // a client that is ahead of us (the daemon restarted) starts over
-            let since = if since > s.seq { 0 } else { since };
-            let keys: Vec<&str> = s.keys.iter().filter(|(n, _)| *n > since).map(|(_, k)| k.as_str()).collect();
-            // a fresh app (since 0) takes a search only from the last 30 s: it was started for it
-            let search = s.search.as_ref().filter(|(n, t, _)| *n > since && (since > 0 || t.elapsed() < Duration::from_secs(30)))
-                .map(|(_, _, txt)| txt.clone());
-            ok(json!({"seq": s.seq, "keys": keys, "playing": s.playing, "paused": s.paused, "title": s.title, "search": search}))
+            ok(events_json(&s, since))
         }
         _ => (404, "text/plain", b"not found".to_vec()),
     }
+}
+
+/// The /events body for a client that has seen up to `since`.
+fn events_json(s: &State, since: u64) -> Value {
+    // a client that is ahead of us (the daemon restarted) starts over
+    let since = if since > s.seq { 0 } else { since };
+    let keys: Vec<&str> = s.keys.iter().filter(|(n, _)| *n > since).map(|(_, k)| k.as_str()).collect();
+    // a fresh app (since 0) takes a search only from the last 30 s: it was started for it
+    let search = s.search.as_ref().filter(|(n, t, _)| *n > since && (since > 0 || t.elapsed() < Duration::from_secs(30)))
+        .map(|(_, _, txt)| txt.clone());
+    json!({"seq": s.seq, "keys": keys, "playing": s.playing, "paused": s.paused, "title": s.title, "search": search,
+           "after": s.after, "channel": s.channel})
 }
 
 /// Percent-decoded query value as search text: printable characters only, at most 60.
@@ -401,4 +447,22 @@ pub fn start(cfg: &'static Cfg, tx: Sender<Cmd>, sh: Arc<Shared>) {
             std::thread::spawn(move || handle(cfg, &api, &tx, &sh, conn));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_after_and_channel() {
+        let s = State { after: "guide".into(), channel: Some("abc".into()), ..Default::default() };
+        let j = events_json(&s, 0);
+        assert_eq!(j["after"], "guide");
+        assert_eq!(j["channel"], "abc");
+        let sh = Shared::default();
+        sh.ended("home");
+        assert_eq!(sh.st.lock().unwrap().after, "home");
+        sh.playing(true, false, "x");
+        assert_eq!(sh.st.lock().unwrap().after, "");
+    }
 }

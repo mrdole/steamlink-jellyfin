@@ -1,0 +1,80 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "sdk",
+      "type": "promptString",
+      "description": "Path to Valve's steamlink-sdk",
+      "default": "${env:HOME}/steamlink-sdk"
+    },
+    {
+      "id": "theme",
+      "type": "promptString",
+      "description": "App theme: a name in themes/ or a path to a theme .yaml",
+      "default": "gruvbox"
+    },
+    {
+      "id": "shotSteps",
+      "type": "promptString",
+      "description": "Keys / steps for the screenshot (needs: ssh -N -L 8097:127.0.0.1:8097 steamlink)",
+      "default": "wait:1500"
+    },
+    {
+      "id": "confirmDeploy",
+      "type": "pickString",
+      "description": "Copy out/ to the Steam Link (SLJF_HOST, default steamlink) and restart the daemon? Stops anything playing.",
+      "options": ["cancel", "deploy"],
+      "default": "cancel"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "check: all",
+      "detail": "Pre-merge checks (CI runs the same): versions, CHANGELOG, cargo test, guide.js + static generator host tests, scripts parse.",
+      "type": "shell",
+      "command": "scripts/check.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": { "kind": "test", "isDefault": true }
+    },
+    {
+      "label": "build: player + daemon",
+      "detail": "sljf-play + sljfd for the Link with the Steam Link SDK -> out/",
+      "type": "shell",
+      "command": "SDK='${input:sdk}' scripts/build.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "build: on-TV app",
+      "detail": "sljf-ui + QML + theme with the Steam Link SDK -> out/app/jellyfin/",
+      "type": "shell",
+      "command": "SDK='${input:sdk}' THEME='${input:theme}' scripts/build-app.sh",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "build: all",
+      "detail": "Player, daemon and the on-TV app -> out/",
+      "dependsOrder": "sequence",
+      "dependsOn": ["build: player + daemon", "build: on-TV app"],
+      "problemMatcher": []
+    },
+    {
+      "label": "render: app screenshot",
+      "detail": "Screenshot of the built app (out/app/jellyfin) offscreen at 1280x720 -> out/shot.png; talks to sljfd through an ssh tunnel on :8097",
+      "type": "shell",
+      "command": "python3 app/shot.py out/shot.png ${input:shotSteps}",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "deploy: to the Link",
+      "detail": "Copies out/ (player, daemon, app if built) to the Steam Link and restarts sljfd (asks first)",
+      "type": "shell",
+      "command": "[ '${input:confirmDeploy}' = deploy ] && scripts/deploy.sh || echo cancelled",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}
