@@ -1,20 +1,26 @@
 //! Local-only HTTP interface (127.0.0.1:8097) for the on-TV app (app/): the app never talks to the
 //! internet itself, so the Link's old system TLS is not involved and the Jellyfin token stays in this process.
 //!
-//!   GET /home                      {resume:[..], nextup:[..], channels:[..], libraries:[..]}  (channels = Live TV)
+//!   GET /home                      {resume:[..], nextup:[..], channels:[..], libraries:[..]}  (channels = the box's own
+//!                                  channels "ch:N" when it has any (chanplay.rs), server Live TV after them only with
+//!                                  show_server_live_tv; else the server's Live TV)
 //!   GET /guide?hours=N             TV guide, N 1..6 (default 3): {now, channels:[{id, number, name, programs:[{id, name,
-//!                                  episode, start, end (epoch s), overview}]}]}, channels by number, empty programs allowed
+//!                                  episode, start, end (epoch s), overview}]}]}, channels by number, empty programs allowed;
+//!                                  box channels (ids ch:N) as for /home
 //!   GET /items?parent=ID&start=N   children of a library / series / season (60 per page)
 //!   GET /search?q=TEXT
-//!   GET /image?id=ID&w=300[&type=Primary|Backdrop|Thumb]     JPEG, cached in /mnt/scratch/sljf/cache
+//!   GET /image?id=ID&w=300[&type=Primary|Backdrop|Thumb]     JPEG, cached in /mnt/scratch/sljf/cache (ch:N = the
+//!                                  channel's collection image)
 //!   GET /detail?id=ID              tracks for the play dialog: {audio:[{index,name,lang}], audio_default,
 //!                                  subs:[{index,name,lang,text}], sub_default (-1 = off)}
 //!   GET /play?id=ID[&from=start][&audio=N][&sub=N]   play (resumes unless from=start; an episode queues the following
 //!                                  ones; audio/sub = stream index, sub=-1 off; the rest of the queue keeps the languages)
+//!   GET /play?id=ch:N              tune box channel N
 //!   GET /control?cmd=pause|unpause|playpause|stop|next|prev|back10|fwd30
 //!   GET /key?k=up|down|left|right|select|back|home          inject a navigation key (tests)
 //!   GET /events?since=N            long poll (25 s): {seq, keys:[..], playing, paused, title, search,
 //!                                  after ("guide" | "home" | "": how playback last ended), channel (last Live TV id | null)}
+//!   GET /cache?f=NAME              stream a cached item (NAME or NAME.part while it is still downloading; no Range)
 //!   GET /text?q=TEXT               open Search with TEXT typed (tests; other machines use the LAN port below)
 //!
 //! LAN API (optional, off unless config `lan_allow` lists addresses): port `lan_port` (default 8098), only from those
@@ -37,6 +43,8 @@ pub enum Cmd {
     Play { ids: Vec<String>, start: usize, ticks: i64, audio: Option<i64>, lang: Option<String>, sub: Option<i64>, sub_lang: Option<String> },
     Control(String),
     Search(String),
+    /// tune box channel N
+    Channel(u32),
 }
 
 #[derive(Default)]
@@ -60,6 +68,8 @@ pub struct Shared {
     pub st: Mutex<State>,
     pub cv: Condvar,
     lang: Mutex<String>, // audio language for picking tracks (user setting or config audio_lang)
+    /// the day's box channels (chanplay.rs loads it)
+    pub lineup: Mutex<Option<Arc<crate::engine::Lineup>>>,
 }
 
 impl Shared {
@@ -159,35 +169,65 @@ fn list(api: &Api, path: &str) -> Value {
 
 const FIELDS: &str = "Fields=Overview&EnableImageTypes=Primary&ImageTypeLimit=1";
 
+/// The server's Live TV guide for the next `hours`; Err when the server does not answer.
+fn server_guide(api: &Api, uid: &str, now: i64, hours: i64) -> Result<Value, ()> {
+    let channels = api.get(&format!("/LiveTv/Channels?UserId={uid}&EnableImageTypes=Primary&ImageTypeLimit=1")).map_err(|_| ())?;
+    // a failed programme query still gives the channel list (the app shows "No information")
+    let programs = api.get(&format!(
+        "/LiveTv/Programs?UserId={uid}&MinEndDate={}&MaxStartDate={}&SortBy=StartDate&Fields=Overview&EnableImageTypes=None&Limit=2000",
+        crate::guide::iso_utc(now), crate::guide::iso_utc(now + hours * 3600)
+    )).unwrap_or_else(|e| { log(&format!("local: {e}")); json!({"Items": []}) });
+    let returned = programs["Items"].as_array().map(|a| a.len()).unwrap_or(0);
+    if let Some(total) = programs["TotalRecordCount"].as_u64().filter(|t| *t > returned as u64) {
+        log(&format!("guide: programmes truncated ({returned} of {total})"));
+    }
+    Ok(crate::guide::guide_json(&channels, &programs, now))
+}
+
 fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &str) -> (u16, &'static str, Vec<u8>) {
     let uid = &cfg.user_id;
     let ok = |v: Value| (200, "application/json", v.to_string().into_bytes());
+    let now = crate::chanplay::now_f() as i64; // wall clock (+ the test-only channel clock offset)
+    // the box's own channels replace the server's Live TV when there are any
+    let lineup = sh.lineup.lock().unwrap().clone().filter(|l| !l.snap.channels.is_empty());
+    let live_tv = || list(api, &format!("/LiveTv/Channels?UserId={uid}&AddCurrentProgram=true&EnableImageTypes=Primary&ImageTypeLimit=1"));
+    let box_channel = || query(q, "id").as_deref().and_then(crate::engine::parse_channel_id)
+        .and_then(|n| lineup.as_ref()?.snap.channels.iter().find(|c| c.number == n).map(|c| (n, c.collection_id.clone())));
     match path {
         // no libraries = no server: say so (the app shows it and tries again) rather than an empty home screen
         "/home" if api.get(&format!("/Users/{uid}/Views")).is_err() => (502, "text/plain", b"jellyfin not answering".to_vec()),
         "/home" => ok(json!({
             "resume": list(api, &format!("/Users/{uid}/Items/Resume?Limit=12&MediaTypes=Video&{FIELDS}")),
             "nextup": list(api, &format!("/Shows/NextUp?UserId={uid}&Limit=12&{FIELDS}")),
-            "channels": list(api, &format!("/LiveTv/Channels?UserId={uid}&AddCurrentProgram=true&EnableImageTypes=Primary&ImageTypeLimit=1")),
+            "channels": match &lineup {
+                Some(l) => {
+                    let mut v = crate::engine::home_channels(&l.snap, &l.rules, now);
+                    if cfg.show_server_live_tv {
+                        if let (Some(a), Some(b)) = (v.as_array_mut(), live_tv().as_array()) {
+                            a.extend(b.iter().cloned());
+                        }
+                    }
+                    v
+                }
+                None => live_tv(),
+            },
             "libraries": list(api, &format!("/Users/{uid}/Views")),
         })),
         "/guide" => {
             let hours = query(q, "hours").and_then(|s| s.parse::<i64>().ok()).unwrap_or(3).clamp(1, 6);
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-            let channels = match api.get(&format!("/LiveTv/Channels?UserId={uid}&EnableImageTypes=Primary&ImageTypeLimit=1")) {
-                Ok(v) => v,
-                Err(_) => return (502, "text/plain", b"jellyfin not answering".to_vec()),
+            let Some(l) = &lineup else {
+                return match server_guide(api, uid, now, hours) {
+                    Ok(g) => ok(g),
+                    Err(()) => (502, "text/plain", b"jellyfin not answering".to_vec()),
+                };
             };
-            // a failed programme query still gives the channel list (the app shows "No information")
-            let programs = api.get(&format!(
-                "/LiveTv/Programs?UserId={uid}&MinEndDate={}&MaxStartDate={}&SortBy=StartDate&Fields=Overview&EnableImageTypes=None&Limit=2000",
-                crate::guide::iso_utc(now), crate::guide::iso_utc(now + hours * 3600)
-            )).unwrap_or_else(|e| { log(&format!("local: {e}")); json!({"Items": []}) });
-            let returned = programs["Items"].as_array().map(|a| a.len()).unwrap_or(0);
-            if let Some(total) = programs["TotalRecordCount"].as_u64().filter(|t| *t > returned as u64) {
-                log(&format!("guide: programmes truncated ({returned} of {total})"));
+            let mut g = crate::engine::guide_json(&l.snap, &l.rules, now, now + hours * 3600, now);
+            if cfg.show_server_live_tv {
+                if let (Ok(sg), Some(a)) = (server_guide(api, uid, now, hours), g["channels"].as_array_mut()) {
+                    a.extend(sg["channels"].as_array().cloned().unwrap_or_default());
+                }
             }
-            ok(crate::guide::guide_json(&channels, &programs, now))
+            ok(g)
         }
         "/items" => {
             let parent = safe(&query(q, "parent").unwrap_or_default());
@@ -221,7 +261,10 @@ fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &st
             ok(Value::Array(all))
         }
         "/image" => {
-            let id = safe(&query(q, "id").unwrap_or_default());
+            let id = match box_channel() {
+                Some((_, collection)) => safe(&collection),
+                None => safe(&query(q, "id").unwrap_or_default()),
+            };
             let w = safe(&query(q, "w").unwrap_or_default()).parse::<u32>().unwrap_or(300).clamp(80, 1280);
             let kind = match query(q, "type").as_deref() { Some("Backdrop") => "Backdrop", Some("Thumb") => "Thumb", _ => "Primary" };
             let file = format!("{CACHE}/{id}-{kind}-{w}.jpg");
@@ -258,6 +301,13 @@ fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &st
             ok(json!({"audio": audio, "audio_default": pick_audio(&item, None, &sh.lang()),
                       "subs": subs, "sub_default": pick_sub(&item, None, &SubPref::Default).unwrap_or(-1)}))
         }
+        "/play" if query(q, "id").as_deref().and_then(crate::engine::parse_channel_id).is_some() => match box_channel() {
+            Some((n, _)) => {
+                let _ = tx.send(Cmd::Channel(n));
+                ok(json!({"ok": true}))
+            }
+            None => (404, "text/plain", b"no such channel".to_vec()),
+        },
         "/play" => {
             let id = safe(&query(q, "id").unwrap_or_default());
             let item = match api.get(&format!("/Users/{uid}/Items/{id}")) {
@@ -418,6 +468,22 @@ fn handle(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, mut conn: TcpStre
     }
     let target = line.split_whitespace().nth(1).unwrap_or("/");
     let (path, q) = target.split_once('?').unwrap_or((target, ""));
+    if path == "/cache" {
+        // streamed (no Content-Length): the body grows while the fetcher downloads; local port only
+        let name = query(q, "f").unwrap_or_default();
+        // the player stops reading for minutes while the next item waits for its cut (its FIFO is
+        // full); a short write timeout would close the socket and end the cached item early. A killed
+        // player closes the socket, so write_all fails anyway.
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(15 * 60)));
+        let r = match crate::fetch::cache_dir() {
+            Some(dir) => crate::fetch::serve(&dir, &name, &|n| crate::fetch::state_of(n), &mut conn),
+            None => Err(404),
+        };
+        if let Err(code) = r {
+            let _ = conn.write_all(format!("HTTP/1.1 {code} Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+        }
+        return;
+    }
     let (code, ctype, body) = route(cfg, api, tx, sh, path, q);
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: {}\r\nConnection: close\r\n\r\n",

@@ -13,5 +13,14 @@
   "lan_port": 8098,
   "open_app_at_boot": false,
   "live_tv_static": true,
-  "static_volume": 8
+  "static_volume": 8,
+  "channels": true,
+  "channel_prefix": "Channel",
+  "show_server_live_tv": false,
+  "schedule_day_start": "06:00",
+  "pad": null,
+  "breaks": "between",
+  "break_minutes": 2,
+  "cache_gb": null,
+  "fetch_rate": 2.0
 }

@@ -22,6 +22,8 @@ Not affiliated with Valve or the Jellyfin project.
   d-pad), which also makes it a `media_player` in Home Assistant's Jellyfin integration.
 - **Live TV** channels from Jellyfin's Live TV (tested with ErsatzTV over an M3U tuner), with a TV guide, and TV
   static with a faint hiss while a channel tunes or rebuffers (both can be turned off).
+- **Channels** built on the box from Jellyfin collections or playlists, scheduled from the clock, with bumpers and
+  commercials from an optional USB stick: [Channels](#channels).
 - **Recovery**: restarts playback where it was after network drops or server hiccups, reconnects after reboots.
 
 ## Integrations (all optional)
@@ -35,6 +37,49 @@ Not affiliated with Valve or the Jellyfin project.
 | Game controller (USB / Bluetooth) | In the app: coded, untested | Pair in the Link's menu: [docs](docs/integrations/input.md) |
 | Keyboard / controller during playback | Not yet | [Roadmap](ROADMAP.md) |
 | Mouse | Not yet | [Roadmap](ROADMAP.md) |
+
+## Channels
+
+The Link can run its own TV channels from your Jellyfin library, with no ErsatzTV or other server needed. A channel
+is a list of shows that rotate marathon-style: each show's episodes in order, season 0 (specials) left out. What is
+on comes from the clock, so you join mid-episode, and every box with the same channel shows the same thing.
+
+**Make a channel.** Name a Jellyfin collection or one of your own playlists `Channel <N> <name>`, for example
+`Channel 10 Classic Sitcoms`, and put whole series or films in it. Non-admin Jellyfin users usually cannot create
+collections (the server answers 403), so a playlist is the easy way: make a playlist, add series or films to it.
+Channels show in the TV guide and on the home screen. The prefix (`Channel`) is a setting, see
+[CONFIG.md](docs/CONFIG.md#tv-channels), which lists every channel key.
+
+**Padding.** Slots are padded to :00 / :30 with bumpers and commercials when the server has a collection or playlist
+named `Bumpers` or `Commercials`. With clips only on the USB stick, set `"pad": true`. When nothing fits a gap, a
+silent static card shows "Up next: <title> at <time>".
+
+**USB stick (optional).** The stick holds bumper and commercial clips, and a cache so upcoming programmes start
+without waiting on the network. Use FAT32 or ext2/3/4, not exFAT. The Link only uses a stick that has a top-level
+`sljf/` folder; others are left alone. sljfd mounts it at `/mnt/sljf-usb`.
+
+```
+sljf/bumpers/all/          used on every channel
+sljf/bumpers/10/           only on channel 10
+sljf/commercials/all/
+sljf/commercials/10/
+sljf/cache/                made and managed by sljfd
+```
+
+Clips must be H.264 8-bit up to 1080p with AAC, MP3 or AC3 sound, in mp4, mkv, ts or m4v. Convert anything else with:
+
+```bash
+ffmpeg -i in.mkv -c:v libx264 -profile:v high -pix_fmt yuv420p \
+  -vf "scale='min(1920,iw)':-2" -c:a aac -ac 2 out.mp4
+```
+
+(Keep the picture within 1920x1080; a clip the Link cannot play is skipped and logged once.)
+
+**YouTube and others.** Only through your library: let a downloader such as Pinchflat, ytdl-sub or Tube Archivist
+put videos into Jellyfin, then add them to a channel. Netflix and the like are DRM and cannot work.
+
+**Not in this release:** commercial breaks inside episodes, loudness matching, subtitles on channels, a fallback
+clock from the server's Date header, and skipping the re-encode of files the Link already plays.
 
 ## What you need
 
@@ -62,7 +107,7 @@ Versions and releases: [CHANGELOG.md](CHANGELOG.md), [docs/RELEASING.md](docs/RE
 
 - One program can use the Link's decoder at a time; pause = the player is stopped and restarted (about 3 s to
   picture on resume).
-- No program guide (Live TV shows what is on now), no seeking in Live TV.
+- No seeking in Live TV or on a channel.
 - Only stereo audio; no surround passthrough.
 - Single-core 1 GHz CPU and ~256 MB RAM: the server does the heavy lifting.
 

@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 void subs_suspend(int on);         /* sljf-subs.c */
+int subs_text_mask(const char *text, uint8_t *mask, int w, int h);
 
 #define FRAME_S (1.0 / 15)          /* new snow this often */
 #define HISS_RATE 48000
@@ -47,6 +48,8 @@ static pthread_t g_th;
 static volatile sig_atomic_t g_bg;  /* the background thread runs */
 static int g_th_up;
 static volatile int32_t g_gain = 65536;   /* the player's volume (SLJF_VOLUME / "volume N"), 1/65536 steps */
+static uint8_t g_card[STATIC_W * STATIC_H];   /* a card's text (static_card), coverage 0-255 */
+static int g_card_on, g_card_y0, g_card_y1;   /* drawn; the rows of its dark band */
 
 void static_set_gain(int32_t g) { g_gain = g; }
 
@@ -65,7 +68,28 @@ static void draw(void) {
     SLVideo_GetOverlayPixels(g_ov[g_ovi], &px, &pitch);
     if (!px) return;
     static_noise(px, STATIC_W, STATIC_H, pitch, &g_seed);
+    for (int y = g_card_on ? g_card_y0 : STATIC_H; y < g_card_y1; y++) {   /* a card: white text on a darker band */
+        uint32_t *row = (uint32_t *)((uint8_t *)px + y * pitch);
+        const uint8_t *m = g_card + y * STATIC_W;
+        for (int x = 0; x < STATIC_W; x++) {
+            uint32_t v = (row[x] & 0xFF) / 3;
+            v += (255 - v) * m[x] / 255;
+            row[x] = 0xFF000000u | v << 16 | v << 8 | v;
+        }
+    }
     SLVideo_ShowOverlay(g_ov[g_ovi]);
+}
+
+void static_card(const char *text) {
+    g_card_on = 0;
+    if (!text || subs_text_mask(text, g_card, STATIC_W, STATIC_H)) return;
+    int y0 = STATIC_H, y1 = 0;
+    for (int y = 0; y < STATIC_H; y++)
+        for (int x = 0; x < STATIC_W; x++) if (g_card[y * STATIC_W + x]) { if (y < y0) y0 = y; y1 = y + 1; break; }
+    if (y1 <= y0) return;                          /* empty text: plain static */
+    g_card_y0 = y0 - 6 < 0 ? 0 : y0 - 6;
+    g_card_y1 = y1 + 6 > STATIC_H ? STATIC_H : y1 + 6;
+    g_card_on = 1;
 }
 
 int static_show(CSLVideoContext *v, int volume) {

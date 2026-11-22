@@ -37,11 +37,12 @@ if command -v cc >/dev/null; then
     T=$(mktemp -d)
     cc -std=c99 -Wall -Wextra -O2 player/test/static-gen-test.c player/static-gen.c -lm -o "$T/sgt" && "$T/sgt" >/dev/null && ok "player static generators" || bad "player static generators (player/test/static-gen-test.c)"
     cc -std=c99 -Wall -Wextra -O2 player/test/live-buf-test.c player/live-buf.c -o "$T/lbt" && "$T/lbt" >/dev/null && ok "player live-buf" || bad "player live-buf (player/test/live-buf-test.c)"
+    cc -std=c99 -Wall -Wextra -O2 player/test/cutplan-test.c player/cutplan.c -o "$T/cpt" && "$T/cpt" >/dev/null && ok "player cutplan" || bad "player cutplan (player/test/cutplan-test.c)"
     rm -rf "$T"
 else
-    echo "skip player static generators + live-buf (cc not found)"
+    echo "skip player static generators + live-buf + cutplan (cc not found)"
 fi
-for f in tools/sljf-login tools/sljf-test tools/sljf-remote app/shot.py; do
+for f in tools/sljf-login tools/sljf-test tools/sljf-chantest tools/sljf-remote app/shot.py; do
     python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f" || bad "python parse $f"
 done
 ok "python scripts parse"
