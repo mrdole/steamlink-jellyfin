@@ -87,8 +87,21 @@ pub fn rules_for(cfg: &Cfg, utc_off: i64) -> Rules {
     }
 }
 
-fn now_f() -> f64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+/// TEST ONLY offset (config `test_clock_offset_s`) added to the channels' clock; 0 in normal use.
+static CLOCK_OFFSET_S: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn set_clock_offset(s: i64) {
+    CLOCK_OFFSET_S.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn clock_offset() -> i64 {
+    CLOCK_OFFSET_S.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The channels' "now": wall clock plus the test offset (schedule, cuts, guide and idle fetch all use this).
+pub fn now_f() -> f64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    t + clock_offset() as f64
 }
 
 /// Cache file of an item fetched from its start.

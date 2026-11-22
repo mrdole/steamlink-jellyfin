@@ -3,7 +3,7 @@
 the way sljfd feeds a channel (first item as "url", the rest as "next" lines), to check the cuts between them.
 
   sljf-chantest ID[:SECONDS[:START_MIN]] ... [--card N]
-      each ID is a library item (episode, film or clip); SECONDS = how long to play it (0 = to its end), START_MIN =
+      each ID is a library item (episode, film or clip) or a file path on the Link (/mnt/sljf-usb/...); SECONDS = how long to play it (0 = to its end), START_MIN =
       where to start in it. --card N puts an N-second "Up next" card (silent static + bar) after every item.
   example: sljf-chantest 1a2b..:40 3c4d..:40:5 --card 3
 
@@ -43,6 +43,10 @@ def main():
         parts = spec.split(":")
         iid, secs = parts[0], float(parts[1]) if len(parts) > 1 else 0
         start = float(parts[2]) if len(parts) > 2 else 0
+        if iid.startswith("/"):                       # a clip file on the Link (stick bumper), as sljfd sends it
+            print(f"item {len(lines) + 1}: file {iid}, {secs or 'all'} s")
+            lines.append(f"url {iid}" if not lines else f"next v {secs:g} {start * 60:g} {iid}")
+            continue
         item = t.api(c, f"/Users/{c['user_id']}/Items/{iid}")
         v = t.video_stream(item)
         copy = t.playable(item)

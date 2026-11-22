@@ -21,6 +21,7 @@
 //!   lan_allow, lan_port: optional LAN API (docs/integrations/lan-api.md); off while lan_allow is empty
 //!   open_app_at_boot: open the on-TV app once the Link's menu is up after a boot (default false)
 //!   live_tv_static, static_volume: Live TV static (default true) and its hiss loudness, percent 0-100 (default 8)
+//!   test_clock_offset_s: TEST ONLY, seconds added to the box channels' "now" (default 0)
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -131,6 +132,9 @@ struct Cfg {
     break_minutes: u32,
     cache_gb: Option<u32>,
     fetch_rate: f64,
+    /// TEST ONLY: seconds added to "now" for the box channels' schedule and guide (0 = off); lets a test bring the
+    /// next item boundary close without waiting for it. Clamped to +-1 day
+    test_clock_offset_s: i64,
 }
 
 fn cfg_day_start(v: &Value) -> i64 {
@@ -198,6 +202,7 @@ impl Cfg {
             break_minutes: v["break_minutes"].as_i64().map(|n| n.clamp(0, 10) as u32).unwrap_or(2),
             cache_gb: v["cache_gb"].as_u64().filter(|&n| n > 0).map(|n| n.min(u32::MAX as u64) as u32),
             fetch_rate: v["fetch_rate"].as_f64().filter(|x| x.is_finite()).map(|x| x.clamp(1.0, 8.0)).unwrap_or(2.0),
+            test_clock_offset_s: v["test_clock_offset_s"].as_i64().map(|n| n.clamp(-86_400, 86_400)).unwrap_or(0),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
             return Err(format!("{path}: server, user_id and token are required (run sljf-login)"));
@@ -1877,6 +1882,10 @@ fn main() {
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     log(&format!("sljfd {VERSION} starting: {} as \"{}\" ({})", cfg.server, cfg.device_name, cfg.device_id));
+    if cfg.test_clock_offset_s != 0 {
+        chanplay::set_clock_offset(cfg.test_clock_offset_s);
+        log(&format!("channels: TEST clock offset {} s (test_clock_offset_s): schedule and guide are shifted", cfg.test_clock_offset_s));
+    }
     sh("killall sljf-play 2>/dev/null");
     release_screen(); // left over from a crash
     prune_cache();
@@ -1926,6 +1935,14 @@ mod tests {
     fn parse(extra: &str) -> Cfg {
         let v: Value = serde_json::from_str(&format!("{{\"server\":\"https://x\",\"user_id\":\"u\",\"token\":\"t\"{extra}}}")).unwrap();
         Cfg::parse(&v, "test").unwrap()
+    }
+
+    #[test]
+    fn cfg_test_clock_offset_off_by_default_and_clamped() {
+        assert_eq!(parse("").test_clock_offset_s, 0);
+        assert_eq!(parse(",\"test_clock_offset_s\":1500").test_clock_offset_s, 1500);
+        assert_eq!(parse(",\"test_clock_offset_s\":-999999").test_clock_offset_s, -86_400);
+        assert_eq!(parse(",\"test_clock_offset_s\":\"x\"").test_clock_offset_s, 0);
     }
 
     #[test]

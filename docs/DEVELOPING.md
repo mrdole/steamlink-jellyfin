@@ -28,6 +28,10 @@ Every script takes `SLJF_HOST` (ssh alias of the Link, default `steamlink`) and 
 The test tools use the Link's own login (read over ssh for the run). Only one program may use the decoder: check
 `tools/sljf-remote status` shows nothing playing before running `sljf-test`.
 
+To check a channel's cuts without waiting for the next boundary, put `"test_clock_offset_s": N` in the Link's
+`config.json` ([CONFIG](CONFIG.md)), restart sljfd and tune the channel: its schedule and guide run N seconds ahead.
+Pick N from the guide (`/guide` on 127.0.0.1:8097) so the boundary is a minute or two away. Remove it afterwards.
+
 ## Host tests
 
 `scripts/check.sh` (also CI) runs, besides the daemon's `cargo test`, two small host tests when their tool exists:

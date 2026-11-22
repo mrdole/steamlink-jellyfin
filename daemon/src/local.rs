@@ -187,7 +187,7 @@ fn server_guide(api: &Api, uid: &str, now: i64, hours: i64) -> Result<Value, ()>
 fn route(cfg: &Cfg, api: &Api, tx: &Sender<Cmd>, sh: &Shared, path: &str, q: &str) -> (u16, &'static str, Vec<u8>) {
     let uid = &cfg.user_id;
     let ok = |v: Value| (200, "application/json", v.to_string().into_bytes());
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::chanplay::now_f() as i64; // wall clock (+ the test-only channel clock offset)
     // the box's own channels replace the server's Live TV when there are any
     let lineup = sh.lineup.lock().unwrap().clone().filter(|l| !l.snap.channels.is_empty());
     let live_tv = || list(api, &format!("/LiveTv/Channels?UserId={uid}&AddCurrentProgram=true&EnableImageTypes=Primary&ImageTypeLimit=1"));

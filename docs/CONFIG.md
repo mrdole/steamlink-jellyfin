@@ -48,6 +48,7 @@ to an existing channel follow the same rule. A restart of sljfd alone keeps toda
 | `break_minutes` | `2` | Length of a break in minutes, 0-10 |
 | `cache_gb` | auto | Disk the Link may use to cache upcoming programmes, in GB; absent or `0` = chosen from free space |
 | `fetch_rate` | `2.0` | How many times faster than real time upcoming programmes are fetched, 1-8 |
+| `test_clock_offset_s` | `0` | **Testing only.** Seconds added to "now" for the box channels (schedule, cuts, guide). Set it so the next programme or filler boundary is a minute or two away instead of waiting for it, restart sljfd, tune, and take it out (or set 0) afterwards. sljfd logs `channels: TEST clock offset N s` at start while it is on. Clamped to ±86400 |
 
 ## Optional integrations
 
