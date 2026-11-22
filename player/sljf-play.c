@@ -86,6 +86,7 @@
 #define AUDIO_CHUNK_SAMPLES (AUDIO_RATE * AUDIO_CHUNK_MS / 1000)
 #define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * AUDIO_CH * 2)
 #define AHEAD_MS 1000            /* keep about this much queued in each decoder */
+#define GAP_AHEAD_MS 4000        /* a decoder stream made again, before its first picture (see room below) */
 #define SYNC_SLACK_MS 45         /* leave smaller A/V offsets alone */
 #define SYNC_MAX_MS 3000         /* largest single correction */
 #define V_NONE (-1e9)            /* v_first not known yet */
@@ -843,7 +844,11 @@ int main(int argc, char **argv) {
         }
         if (cur->over) { usleep(5000); continue; }        /* channel: limit reached, waiting for the next */
         /* back-pressure: both decoders hold about AHEAD_MS; no room while both are full */
-        int room = !(vq > AHEAD_MS && (!astr || aq > AHEAD_MS || a_hold));   /* (sound held after a cut: video alone) */
+        /* a decoder stream made again shows nothing until it holds enough: it may need more than AHEAD_MS (a 29.97 fps
+           stick clip after a 1080p episode sat at 1063 ms queued with no picture, and nothing more was fed: stuck on
+           static, 2026-11-21), so until its first picture it may take up to GAP_AHEAD_MS */
+        uint32_t ahead_ms = gap_t0 >= 0 && !it_started ? GAP_AHEAD_MS : AHEAD_MS;
+        int room = !(vq > ahead_ms && (!astr || aq > AHEAD_MS || a_hold));   /* (sound held after a cut: video alone) */
         /* inline read (no prebuffer): one packet when the decoders have room */
         int want_read = !cur->threaded && !eof && cur->fifo_n < FIFO_MAX && (prebuf > 0 ? fifo_span(cur) < g_ahead : (!cur->fifo_n && room));
         if (want_read) {
