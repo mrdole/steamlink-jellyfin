@@ -19,6 +19,7 @@ Every script takes `SLJF_HOST` (ssh alias of the Link, default `steamlink`) and 
 | Tool | Does |
 |---|---|
 | `tools/sljf-test [query or item id or file] --seconds N --start MIN [--transcode] [--subs N] [--info]` | Plays one item on the Link with the player directly (no daemon), prints the status lines. `--info` only shows the choice and URL |
+| `tools/sljf-chantest ID[:SECONDS[:START_MIN]] ... [--card N]` | Plays several items through one `sljf-play --channel` run (as sljfd feeds a channel) to check the cuts; the test build goes to `/tmp` on the Link |
 | `tools/sljf-remote status | play <id> [--at MIN] | pause | unpause | seek MIN | stop | key up|down|...` | Drives the daemon through the Jellyfin server, like a Jellyfin app does |
 | `tools/sljf-memwatch [MINUTES] [INTERVAL_S]` | CSV of the Link's memory and our processes, for soak tests |
 | `tools/make-sync-test.sh` | Generates `out/sync-test.ts`: a bar crosses a line with a flash + beep every 2 s. Play it with `tools/sljf-test out/sync-test.ts --seconds 120 --av-offset MS` to find `av_offset_ms` |
@@ -26,6 +27,10 @@ Every script takes `SLJF_HOST` (ssh alias of the Link, default `steamlink`) and 
 
 The test tools use the Link's own login (read over ssh for the run). Only one program may use the decoder: check
 `tools/sljf-remote status` shows nothing playing before running `sljf-test`.
+
+To check a channel's cuts without waiting for the next boundary, put `"test_clock_offset_s": N` in the Link's
+`config.json` ([CONFIG](CONFIG.md)), restart sljfd and tune the channel: its schedule and guide run N seconds ahead.
+Pick N from the guide (`/guide` on 127.0.0.1:8097) so the boundary is a minute or two away. Remove it afterwards.
 
 ## Host tests
 

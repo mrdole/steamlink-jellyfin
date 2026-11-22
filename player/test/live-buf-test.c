@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 /* Host test for player/live-buf.c:  cc -std=c99 -Wall -Wextra player/test/live-buf-test.c player/live-buf.c */
 #include "../live-buf.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
@@ -9,6 +11,17 @@ int main(void) {
     /* read-ahead cap: well past the target, so faster-than-real-time stretches build a cushion */
     CHECK(livebuf_ahead(3.0) == LIVEBUF_AHEAD_S);
     CHECK(livebuf_ahead(20.0) == 21.0);
+
+    /* SLJF_READAHEAD_S: honoured, clamped to 1..120, garbage = default 12 */
+    setenv("SLJF_READAHEAD_S", "60", 1);  CHECK(livebuf_ahead(3.0) == 60.0);
+    setenv("SLJF_READAHEAD_S", "500", 1); CHECK(livebuf_ahead(3.0) == 120.0);
+    setenv("SLJF_READAHEAD_S", "0.2", 1); CHECK(livebuf_ahead(0.0) == 1.0);
+    setenv("SLJF_READAHEAD_S", "abc", 1); CHECK(livebuf_ahead(3.0) == 12.0);
+    setenv("SLJF_READAHEAD_S", "", 1);    CHECK(livebuf_ahead(3.0) == 12.0);
+    setenv("SLJF_READAHEAD_S", "-5", 1);  CHECK(livebuf_ahead(3.0) == 12.0);
+    setenv("SLJF_READAHEAD_S", "60", 1);  CHECK(livebuf_ahead(80.0) == 81.0);   /* prebuffer still wins when larger */
+    unsetenv("SLJF_READAHEAD_S");
+    CHECK(livebuf_ahead(3.0) == 12.0);
 
     /* picture watch */
     struct picwatch w = {0};

@@ -25,6 +25,19 @@
       "description": "Copy out/ to the Steam Link (SLJF_HOST, default steamlink) and restart the daemon? Stops anything playing.",
       "options": ["cancel", "deploy"],
       "default": "cancel"
+    },
+    {
+      "id": "chanItems",
+      "type": "promptString",
+      "description": "Items for the channel test: ID[:SECONDS[:START_MIN]] ... [--card N] (e.g. 1a2b..:40 3c4d..:40:5 --card 3)",
+      "default": ""
+    },
+    {
+      "id": "confirmChantest",
+      "type": "pickString",
+      "description": "Run a channel test on the Steam Link (SLJF_HOST, default steamlink)? Stops anything playing there.",
+      "options": ["cancel", "run"],
+      "default": "cancel"
     }
   ],
   "tasks": [
@@ -65,6 +78,14 @@
       "detail": "Screenshot of the built app (out/app/jellyfin) offscreen at 1280x720 -> out/shot.png; talks to sljfd through an ssh tunnel on :8097",
       "type": "shell",
       "command": "python3 app/shot.py out/shot.png ${input:shotSteps}",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "test: channel cuts on the Link",
+      "detail": "Plays the given items through one sljf-play --channel run on the Link (needs out/ from build) and prints the player's lines; asks first",
+      "type": "shell",
+      "command": "if [ '${input:confirmChantest}' = run ]; then tools/sljf-chantest ${input:chanItems}; else echo cancelled; fi",
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     },

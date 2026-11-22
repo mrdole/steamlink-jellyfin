@@ -21,6 +21,7 @@
 //!   lan_allow, lan_port: optional LAN API (docs/integrations/lan-api.md); off while lan_allow is empty
 //!   open_app_at_boot: open the on-TV app once the Link's menu is up after a boot (default false)
 //!   live_tv_static, static_volume: Live TV static (default true) and its hiss loudness, percent 0-100 (default 8)
+//!   test_clock_offset_s: TEST ONLY, seconds added to the box channels' "now" (default 0)
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -30,8 +31,15 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+mod filler;
+mod fetch;
+mod usb;
+mod engine;
 mod guide;
 mod local;
+mod chan;
+mod chanplay;
+mod sched;
 
 /// Release version: daemon/Cargo.toml = VERSION at the repo root (scripts/bump-version).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -111,6 +119,53 @@ struct Cfg {
     static_volume: u8,
     /// start volume 0-100 for sljf-play (100 = untouched); a remote changes it until sljfd restarts
     volume: u8,
+    /// link-side TV channels from server collections "Channel N Name"
+    channels: bool,
+    channel_prefix: String,
+    show_server_live_tv: bool,
+    /// local time the schedule day starts, seconds after midnight
+    schedule_day_start: i64,
+    /// Some(true/false) forces padding of slots on/off; None = on when the channel has filler pools
+    pad: Option<bool>,
+    /// "between" or "off"
+    breaks: String,
+    break_minutes: u32,
+    cache_gb: Option<u32>,
+    fetch_rate: f64,
+    /// TEST ONLY: seconds added to "now" for the box channels' schedule and guide (0 = off); lets a test bring the
+    /// next item boundary close without waiting for it. Clamped to +-1 day
+    test_clock_offset_s: i64,
+}
+
+fn cfg_day_start(v: &Value) -> i64 {
+    const DEFAULT: i64 = 6 * 3600;
+    if v.is_null() {
+        return DEFAULT;
+    }
+    let parsed = v.as_str().and_then(|s| {
+        let (h, m) = s.trim().split_once(':')?;
+        if h.len() != 2 || m.len() != 2 {
+            return None;
+        }
+        let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+        ((0..24).contains(&h) && (0..60).contains(&m)).then_some(h * 3600 + m * 60)
+    });
+    parsed.unwrap_or_else(|| {
+        log(&format!("config: schedule_day_start {v} is not HH:MM, using 06:00"));
+        DEFAULT
+    })
+}
+
+fn cfg_breaks(v: &Value) -> String {
+    match v.as_str() {
+        None if v.is_null() => "between".into(),
+        Some("between") => "between".into(),
+        Some("off") => "off".into(),
+        _ => {
+            log(&format!("config: breaks {v} not understood, using \"between\""));
+            "between".into()
+        }
+    }
 }
 
 impl Cfg {
@@ -138,6 +193,16 @@ impl Cfg {
             live_tv_static: v["live_tv_static"].as_bool().unwrap_or(true),
             static_volume: v["static_volume"].as_u64().map(|n| n.min(100) as u8).unwrap_or(8),
             volume: cfg_volume(&v["volume"]),
+            channels: v["channels"].as_bool().unwrap_or(true),
+            channel_prefix: s("channel_prefix", "Channel"),
+            show_server_live_tv: v["show_server_live_tv"].as_bool().unwrap_or(false),
+            schedule_day_start: cfg_day_start(&v["schedule_day_start"]),
+            pad: v["pad"].as_bool(),
+            breaks: cfg_breaks(&v["breaks"]),
+            break_minutes: v["break_minutes"].as_i64().map(|n| n.clamp(0, 10) as u32).unwrap_or(2),
+            cache_gb: v["cache_gb"].as_u64().filter(|&n| n > 0).map(|n| n.min(u32::MAX as u64) as u32),
+            fetch_rate: v["fetch_rate"].as_f64().filter(|x| x.is_finite()).map(|x| x.clamp(1.0, 8.0)).unwrap_or(2.0),
+            test_clock_offset_s: v["test_clock_offset_s"].as_i64().map(|n| n.clamp(-86_400, 86_400)).unwrap_or(0),
         };
         if c.server.is_empty() || c.user_id.is_empty() || c.token.is_empty() {
             return Err(format!("{path}: server, user_id and token are required (run sljf-login)"));
@@ -510,6 +575,7 @@ struct Player {
     next_label: Option<(usize, String)>, // queue index + "S3E6 Title" of the next item, for the countdown
     volume: u8,                     // 0-100, from config.json, then the remote's SetVolume / VolumeUp / VolumeDown
     muted: bool,
+    ch: chanplay::Chans,            // box channels: lineup, stick, fetcher, the channel playing (chanplay.rs)
 }
 
 /// "Series · S3E5 Episode", "Film (1984)" or "11 Channel · Program" for the on-screen bar
@@ -1141,6 +1207,7 @@ impl Player {
     }
 
     fn stop(&mut self, clear_queue: bool) {
+        self.chan_stop();
         self.kill_standby();
         if self.now.is_some() {
             self.kill_child();
@@ -1262,6 +1329,7 @@ impl Player {
         if let Some(w) = self.now.as_mut().and_then(|n| n.child.as_mut()).and_then(|c| c.stdin.as_mut()) {
             let _ = w.write_all(line.as_bytes()).and_then(|_| w.flush());
         }
+        self.chan_write(&line);
         self.report("progress", Some("VolumeChange"));
     }
 
@@ -1301,6 +1369,9 @@ impl Player {
     ///   Up      show the bar
     ///   Down    sleep timer: off -> 30 -> 60 -> 90 min -> off
     fn remote_key(&mut self, k: &str) {
+        if self.ch.play.is_some() {
+            return self.chan_key(k);
+        }
         log(&format!("remote {k} during playback"));
         self.auto_eps = 0;
         let (live, paused, pos, runtime) = match self.now.as_ref() {
@@ -1331,13 +1402,7 @@ impl Player {
             }
             "MoveUp" => bar(self, None),
             "MoveDown" => {
-                let left = self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs() / 60);
-                self.sleep_at = match left {
-                    None => Some(SLEEP_STEPS[0]),
-                    Some(m) => SLEEP_STEPS.iter().copied().find(|&s| s > m + 1),
-                }
-                .map(|m| Instant::now() + Duration::from_secs(m * 60));
-                log(&format!("sleep timer: {}", self.sleep_at.map(|t| format!("{} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).unwrap_or_else(|| "off".into())));
+                self.cycle_sleep();
                 let at = self.seek_to.map(|(t, _)| t);
                 bar(self, at)
             }
@@ -1354,7 +1419,21 @@ impl Player {
         }
     }
 
+    /// Sleep timer: off -> 30 -> 60 -> 90 min -> off.
+    fn cycle_sleep(&mut self) {
+        let left = self.sleep_at.map(|t| t.saturating_duration_since(Instant::now()).as_secs() / 60);
+        self.sleep_at = match left {
+            None => Some(SLEEP_STEPS[0]),
+            Some(m) => SLEEP_STEPS.iter().copied().find(|&s| s > m + 1),
+        }
+        .map(|m| Instant::now() + Duration::from_secs(m * 60));
+        log(&format!("sleep timer: {}", self.sleep_at.map(|t| format!("{} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).unwrap_or_else(|| "off".into())));
+    }
+
     fn next(&mut self, step: i64) {
+        if self.ch.play.is_some() {
+            return self.chan_flip(step); // a box channel: next / previous change channel
+        }
         let mut qi = self.qi as i64 + step;
         let chan = self.now.as_ref().map(|n| n.chan).unwrap_or(false);
         if chan && !self.queue.is_empty() {
@@ -1455,7 +1534,7 @@ impl Player {
             // navigation for the on-TV app (Jellyfin apps and Home Assistant send these through the server)
             // while something plays the on-TV app is closed (the player has the screen), so the d-pad keys would go
             // nowhere: Back / Home stop playback (the app comes back where you were), OK pauses and resumes
-            "GeneralCommand" if self.now.is_some()
+            "GeneralCommand" if (self.now.is_some() || self.ch.play.is_some())
                 && matches!(data["Name"].as_str(), Some("Back" | "GoHome" | "Select" | "MoveUp" | "MoveDown" | "MoveLeft" | "MoveRight")) =>
             {
                 self.remote_key(data["Name"].as_str().unwrap_or(""))
@@ -1500,7 +1579,7 @@ impl Player {
         if t.is_empty() {
             return;
         }
-        if self.now.is_some() {
+        if self.now.is_some() || self.ch.play.is_some() {
             return log(&format!("search \"{t}\": ignored, something is playing"));
         }
         log(&format!("search \"{t}\""));
@@ -1524,7 +1603,13 @@ impl Player {
                     self.command("Playstate", &json!({"Command": name}));
                 }
                 local::Cmd::Search(t) => self.search_text(&t),
+                local::Cmd::Channel(n) => self.play_channel(n),
             }
+        }
+        self.chan_house();
+        if self.ch.play.is_some() {
+            // a box channel: its own lines (item N start / end, queue empty) drive it, not the film/episode code below
+            return self.chan_tick();
         }
         while let Ok(f) = self.sub_rx.try_recv() {
             match f.result {
@@ -1797,6 +1882,10 @@ fn main() {
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     log(&format!("sljfd {VERSION} starting: {} as \"{}\" ({})", cfg.server, cfg.device_name, cfg.device_id));
+    if cfg.test_clock_offset_s != 0 {
+        chanplay::set_clock_offset(cfg.test_clock_offset_s);
+        log(&format!("channels: TEST clock offset {} s (test_clock_offset_s): schedule and guide are shifted", cfg.test_clock_offset_s));
+    }
     sh("killall sljf-play 2>/dev/null");
     release_screen(); // left over from a crash
     prune_cache();
@@ -1815,7 +1904,7 @@ fn main() {
         cfg, api: Api::new(cfg), standby: None, settle: false, queue: vec![], qi: 0, now: None, last_awake: Instant::now(),
         asked_audio: None, lang: cfg.audio_lang.clone(), asked_sub: None, sub_pref: SubPref::Default, cmds, sub_tx, sub_rx, shared,
         card: None, seek_to: None, sleep_at: None, auto_eps: 0, no_next: false, next_label: None,
-        volume: cfg.volume, muted: false,
+        volume: cfg.volume, muted: false, ch: chanplay::Chans::new(),
     };
     let mut wait = 2;
     loop {
@@ -1849,6 +1938,14 @@ mod tests {
     }
 
     #[test]
+    fn cfg_test_clock_offset_off_by_default_and_clamped() {
+        assert_eq!(parse("").test_clock_offset_s, 0);
+        assert_eq!(parse(",\"test_clock_offset_s\":1500").test_clock_offset_s, 1500);
+        assert_eq!(parse(",\"test_clock_offset_s\":-999999").test_clock_offset_s, -86_400);
+        assert_eq!(parse(",\"test_clock_offset_s\":\"x\"").test_clock_offset_s, 0);
+    }
+
+    #[test]
     fn cfg_static_defaults() {
         let c = parse("");
         assert!(c.live_tv_static);
@@ -1861,6 +1958,36 @@ mod tests {
         assert!(!c.live_tv_static);
         assert_eq!(c.static_volume, 100);
         assert_eq!(parse(",\"static_volume\":0").static_volume, 0);
+    }
+
+    #[test]
+    fn cfg_channel_defaults() {
+        let c = parse("");
+        assert!(c.channels);
+        assert_eq!(c.channel_prefix, "Channel");
+        assert!(!c.show_server_live_tv);
+        assert_eq!(c.schedule_day_start, 21600);
+        assert_eq!(c.pad, None);
+        assert_eq!(c.breaks, "between");
+        assert_eq!(c.break_minutes, 2);
+        assert_eq!(c.cache_gb, None);
+        assert_eq!(c.fetch_rate, 2.0);
+    }
+
+    #[test]
+    fn cfg_channel_values_clamped() {
+        let c = parse(",\"break_minutes\":99,\"fetch_rate\":0,\"schedule_day_start\":\"25:00\",\"breaks\":\"sometimes\"");
+        assert_eq!(c.break_minutes, 10);
+        assert_eq!(c.fetch_rate, 1.0);
+        assert_eq!(c.schedule_day_start, 21600);
+        assert_eq!(c.breaks, "between");
+        let c = parse(",\"fetch_rate\":50,\"break_minutes\":-4,\"schedule_day_start\":\"05:30\",\"breaks\":\"off\",\"pad\":false,\"cache_gb\":8");
+        assert_eq!(c.fetch_rate, 8.0);
+        assert_eq!(c.break_minutes, 0);
+        assert_eq!(c.schedule_day_start, 19800);
+        assert_eq!(c.breaks, "off");
+        assert_eq!(c.pad, Some(false));
+        assert_eq!(c.cache_gb, Some(8));
     }
 
     #[test]

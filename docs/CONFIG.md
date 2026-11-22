@@ -24,6 +24,32 @@ Example with every key: [examples/config.example.json](../examples/config.exampl
 | `player` | `/mnt/scratch/sljf/sljf-play` | Path of the player binary |
 | `ca` | `/mnt/scratch/sljf/ca.pem` | CA bundle used for HTTPS |
 
+## TV channels
+
+Collections or playlists on the Jellyfin server named `Channel 10 Classic Sitcoms` become TV channels on the Link; collections named
+`Bumpers` / `Commercials` (optionally with a channel number, `Commercials 10`) are the filler that pads the gaps. Playlists work the same way and
+suit a Link account that may not create collections: episodes in a playlist are grouped into one show per series,
+and a movie is its own show. A collection and a playlist with the same channel number: the lower id wins.
+
+The day's lineup is read once per schedule day (at `schedule_day_start`) and kept for the day: a new or renamed
+channel collection/playlist, or a changed `channel_prefix`, shows up at the next schedule day start. Episodes added
+to an existing channel follow the same rule. A restart of sljfd alone keeps today's saved lineup
+(`/mnt/scratch/sljf/cache/channels.json`); to pick a change up at once, delete that file and restart sljfd
+(`/etc/init.d/startup/S98sljfd restart`).
+
+| Key | Default | What |
+|---|---|---|
+| `channels` | `true` | Build channels from the server's collections |
+| `channel_prefix` | `Channel` | Word a collection name starts with to be a channel: `<prefix> <number> <name>` |
+| `show_server_live_tv` | `false` | Also list the server's own Live TV channels |
+| `schedule_day_start` | `"06:00"` | Local time the schedule day starts (`HH:MM`); anything else falls back to 06:00 and is logged |
+| `pad` | auto | `true`/`false` forces padding of each slot to the half hour on/off; absent = pad when the channel has Bumpers/Commercials |
+| `breaks` | `"between"` | `"between"`: a commercial break (up to `break_minutes`) after each programme; `"off"`: no commercials (a padded slot is filled with bumpers only, or the "Up next" card). Anything else = `"between"` |
+| `break_minutes` | `2` | Length of a break in minutes, 0-10 |
+| `cache_gb` | auto | Disk the Link may use to cache upcoming programmes, in GB; absent or `0` = chosen from free space |
+| `fetch_rate` | `2.0` | How many times faster than real time upcoming programmes are fetched, 1-8 |
+| `test_clock_offset_s` | `0` | **Testing only.** Seconds added to "now" for the box channels (schedule, cuts, guide). Set it so the next programme or filler boundary is a minute or two away instead of waiting for it, restart sljfd, tune, and take it out (or set 0) afterwards. sljfd logs `channels: TEST clock offset N s` at start while it is on. Clamped to ±86400 |
+
 ## Optional integrations
 
 | Key | Default | What |
