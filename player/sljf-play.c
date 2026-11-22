@@ -87,6 +87,7 @@
 #define AUDIO_CHUNK_BYTES (AUDIO_CHUNK_SAMPLES * AUDIO_CH * 2)
 #define AHEAD_MS 1000            /* keep about this much queued in each decoder */
 #define GAP_AHEAD_MS 4000        /* a decoder stream made again, before its first picture (see room below) */
+#define GAP_GIVEUP_S 10.0        /* ... and how long it may take to show one before its item is skipped */
 #define SYNC_SLACK_MS 45         /* leave smaller A/V offsets alone */
 #define SYNC_MAX_MS 3000         /* largest single correction */
 #define V_NONE (-1e9)            /* v_first not known yet */
@@ -625,6 +626,7 @@ int main(int argc, char **argv) {
     double gap_t0 = -1;                               /* the decoder stream was made again then: no picture yet */
     double it_vfed0 = 0;                              /* video seconds fed before this item */
     int it_started = 0, it_eof_said = 0, it_err_said = 0, q_empty_said = 0;
+    int force_reset = 0;                              /* the decoder stream showed nothing: the next cut makes a new one */
     double it_start_t = 0;                            /* when this item's first picture showed */
     int a_hold = 0;                                   /* the new item's sound is held after a cut (1 same stream, 2 new
                                                          stream: not before its first picture) until in step, see below */
@@ -751,6 +753,13 @@ int main(int argc, char **argv) {
                 printf("item %d: sound from %.2f s, %.0f ms silence first, %d packets held\n", cur->seq, from, chunks * (double)AUDIO_CHUNK_MS, kept);
                 a_hold = 0; sync_hold = t + 3.0;
             }
+            /* a decoder stream made again that shows no picture in GAP_GIVEUP_S: end the item (the static stays up) and
+               make a fresh stream for the next one, rather than static until the channel is changed */
+            if (gap_t0 >= 0 && !it_started && card_end < 0 && !cur->over && t - gap_t0 > GAP_GIVEUP_S) {
+                printf("item %d: no picture after %.0f s, skipped\n", cur->seq, t - gap_t0);
+                pthread_mutex_lock(&q_mu); cur->over = 1; pthread_mutex_unlock(&q_mu);
+                force_reset = 1; g_broke = 1;
+            }
             pthread_mutex_lock(&q_mu);
             int rerr = card_end < 0 ? cur->rd_err : 0;
             int out = card_end >= 0 ? t >= card_end : cur->over || (!cur->fifo_n && (cur->rd_eof || cur->rd_err));
@@ -773,6 +782,8 @@ int main(int argc, char **argv) {
                     struct pend *hd = &g_q[g_qh];
                     enum cut k = cut_kind(vw, vh, hd->card ? 0 : nxt->w, hd->card ? 0 : nxt->h, hd->card);
                     if (card_end >= 0 && k == CUT_SAME) k = CUT_RESET;   /* after a card: a fresh decoder stream (see below) */
+                    if (force_reset && k == CUT_SAME) k = CUT_RESET;     /* the stream showed nothing (see GAP_GIVEUP_S) */
+                    force_reset = 0;
                     if (k != CUT_SAME && card_end < 0) {   /* the old picture plays out first (vq does not always reach 0) */
                         if (drain_until < 0) drain_until = t + vq / 1000.0 + 1.0;
                         if (vq > 0 && t < drain_until) { usleep(5000); continue; }
